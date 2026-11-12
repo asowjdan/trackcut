@@ -1,5 +1,5 @@
-# Windows GNU 툴체인의 기본 링커(GNU ld)는 한글 같은 비ASCII 경로의 파일을 열지 못한다.
-# Rust에 함께 들어 있는 lld를 직접 써서, 프로젝트가 어떤 이름의 폴더에 있어도 빌드되게 한다.
+# Windows GNU 툴체인에서는 Rust에 함께 들어 있는 lld로 링크한다.
+# 기본 링커(GNU ld)보다 빠르고, 한글 같은 비ASCII 경로의 파일도 열 수 있다.
 [target.x86_64-pc-windows-gnu]
 linker = "rust-lld"
 rustflags = ["-Clinker-flavor=ld.lld", "-Clink-self-contained=yes"]

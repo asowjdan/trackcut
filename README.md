@@ -8,7 +8,10 @@ OBS로 게임을 녹화하면 게임, 마이크, 통화 소리가 각각 다른 
 
 ## 지금 되는 것
 
-화면(UI)은 아직 없다. 편집기의 코어와 이를 확인하는 명령줄 도구가 있다.
+화면까지 전부 Rust로 만든다. 편집 화면(`trackcut-app`)과 명령줄 도구(`trackcut`)가 있다.
+
+- **편집 화면**: 위쪽 미리보기, 아래쪽 타임라인, 오른쪽 믹서. 프레임 단위 이동, 휠 확대·축소, 분할, 구간 삭제, 되돌리기를 지원한다. 소리 재생은 아직 없다.
+- **프레임 정확한 미리보기**: 요청한 프레임 번호와 화면에 나오는 프레임이 정확히 일치한다(테스트로 확인).
 
 - **미디어 분석**: `ffprobe`로 트랙 수, 실제 프레임 시각, 키프레임 위치, 트랙별 시작 시각을 읽는다. 프레임 간격이 고르지 않은 파일(VFR)도 실제 프레임에 맞춘다.
 - **트랙 이름표**: 오디오 트랙에 이름을 넣은 새 파일과 `*.tracks.json` 설명 파일을 만든다. 다시 인코딩하지 않는다.
@@ -39,19 +42,38 @@ trackcut show 녹화.tagged.trackcut.json
 
 시각은 `90f`(프레임), `00:12:03:30`(시:분:초:프레임), `12.5`(초)로 쓰고, 자동으로 프레임 경계에 붙는다.
 
-프로젝트 폴더나 미디어 파일 경로에 한글이 있어도 된다. Windows GNU 툴체인의 기본 링커는 한글 경로를 열지 못해서, `.cargo/config.toml`에서 Rust에 들어 있는 lld 링커를 쓰도록 해 두었다.
+편집 화면은 이렇게 연다. 영상 파일을 창에 끌어다 놓아도 된다.
+
+```bash
+trackcut-app 녹화.tagged.mp4
+```
+
+| 키 | 동작 |
+|---|---|
+| Space | 재생 / 정지 |
+| ← / → | 1프레임 이동 |
+| Shift + ← / → | 1초 이동 |
+| I / O | 시작점 / 끝점 |
+| S | 현재 위치에서 분할 |
+| Delete | 시작점~끝점 구간 삭제 |
+| Ctrl+Z / Ctrl+Y | 되돌리기 / 다시 하기 |
+| Ctrl+S | 프로젝트 저장 |
+| Ctrl+휠 / 휠 | 타임라인 확대·축소 / 좌우 이동 |
+
+미디어 파일과 프로젝트 폴더 경로에 한글이 있어도 된다. 다만 Windows GNU 툴체인의 도구(ld, dlltool)는 한글 경로의 파일을 열지 못하므로, 소스가 한글 경로에 있으면 **빌드 출력만** 영문 경로로 돌린다. 상위 폴더의 `.cargo/config.toml`에 `[build] target-dir`을 적거나 `CARGO_TARGET_DIR` 환경 변수를 쓴다.
 
 ## 구조
 
 | 경로 | 내용 |
 |---|---|
 | `crates/trackcut-core` | 시간 계산, 미디어 분석, 프로젝트 모델, 편집 동작, Undo |
+| `crates/trackcut-app` | 편집 화면 `trackcut-app` (egui) |
 | `crates/trackcut-cli` | 명령줄 도구 `trackcut` |
 | `scripts/check-private.sh` | 개인정보·컴퓨터 정보 검사 |
 
 ## 앞으로 할 것
 
-1. 미리보기 화면과 타임라인(프레임 이동, 휠 확대·축소)
+1. 소리 재생, 파형과 썸네일, 클립 드래그(트림·이동)
 2. 트랙별 노이즈 제거와 음성 보정(FFmpeg 필터)
 3. 다른 파일 추가와 화면 전환 효과
 4. 스마트 렌더 내보내기: 손대지 않은 구간은 원본을 그대로 복사하고 바뀐 구간만 다시 인코딩
@@ -73,7 +95,7 @@ git config core.hooksPath .githooks
 ## 사용한 오픈소스
 
 - [FFmpeg](https://ffmpeg.org): 분석, 디코딩, 필터, 인코딩
-- [Rust](https://www.rust-lang.org), [serde](https://serde.rs)
+- [Rust](https://www.rust-lang.org), [serde](https://serde.rs), [egui / eframe](https://github.com/emilk/egui)
 
 ## 라이선스
 

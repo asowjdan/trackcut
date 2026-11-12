@@ -1,0 +1,14 @@
+[package]
+name = "trackcut-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trackcut-app"
+path = "src/main.rs"
+
+[dependencies]
+trackcut-core = { path = "../trackcut-core" }
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }

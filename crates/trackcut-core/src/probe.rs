@@ -16,17 +16,28 @@ pub fn tool_path(name: &str) -> OsString {
     std::env::var_os(var).unwrap_or_else(|| name.into())
 }
 
+/// 창이 있는 앱에서 ffmpeg를 실행할 때 검은 콘솔 창이 뜨지 않게 한다.
+pub(crate) fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 pub fn run_tool<I, S>(name: &str, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
     let tool_err = |message: String| Error::Tool { tool: name.to_string(), message };
-    let out = Command::new(tool_path(name))
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| tool_err(e.to_string()))?;
+    let mut command = Command::new(tool_path(name));
+    command.args(args).stdin(Stdio::null());
+    hide_console(&mut command);
+    let out = command.output().map_err(|e| tool_err(e.to_string()))?;
     if !out.status.success() {
         return Err(tool_err(String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }

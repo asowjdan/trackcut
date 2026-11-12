@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/trackcut-core", "crates/trackcut-cli"]
+members = ["crates/trackcut-core", "crates/trackcut-cli", "crates/trackcut-app"]
 resolver = "2"
 
 [workspace.package]

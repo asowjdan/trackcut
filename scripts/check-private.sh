@@ -37,8 +37,8 @@ patterns=(
   '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)'
   'gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY'
 )
-# 허용: 예시 도메인, GitHub noreply 주소, 루프백 주소
-allowed='@example\.(com|org)|noreply@|@users\.noreply\.github\.com|127\.0\.0\.1|0\.0\.0\.0'
+# 허용: 예시 도메인, GitHub noreply 주소, 루프백 주소, 패키지 버전 표기(Cargo.lock의 `version = "…"`)
+allowed='@example\.(com|org)|noreply@|@users\.noreply\.github\.com|127\.0\.0\.1|0\.0\.0\.0|^[0-9]+:version = "'
 
 # 이 컴퓨터의 사용자 이름과 컴퓨터 이름(저장소에는 적지 않고 실행할 때 읽는다). CI에서는 건너뛴다.
 local_words=()
