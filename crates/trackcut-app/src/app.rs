@@ -14,6 +14,8 @@ use trackcut_core::probe::probe;
 use trackcut_core::project::{Clip, Project, TrackKind, VOLUME_MAX_DB, VOLUME_MIN_DB};
 use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, timecode, Flicks, FLICKS_PER_SEC};
 
+use crate::export_ui::ExportUi;
+use crate::sound::Sound;
 use crate::timeline::{self, Marks, View};
 use crate::Options;
 
@@ -66,6 +68,10 @@ pub struct TrackcutApp {
     wanted: Option<(u64, u64)>,
     shown: Option<(u64, u64)>,
     status: String,
+    sound: Sound,
+    /// 소리 엔진에 재생을 지시해 둔 상태인지
+    sound_playing: bool,
+    export: ExportUi,
     frames_drawn: u32,
     shot_sent: bool,
 }
@@ -88,6 +94,9 @@ impl TrackcutApp {
             wanted: None,
             shown: None,
             status: String::new(),
+            sound: Sound::new(),
+            sound_playing: false,
+            export: ExportUi::default(),
             frames_drawn: 0,
             shot_sent: false,
             options,
@@ -110,7 +119,7 @@ impl TrackcutApp {
         self.status = "파일 분석 중…".into();
     }
 
-    fn finish_loading(&mut self) {
+    fn finish_loading(&mut self, ctx: &egui::Context) {
         let Some(result) = self.loading.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
         self.loading = None;
         match result {
@@ -120,12 +129,13 @@ impl TrackcutApp {
                     None => 0,
                 };
                 self.options.seek = None;
+                self.sound.load(&project, ctx);
                 self.project = Some(project);
                 self.project_path = path;
                 self.history = History::default();
                 self.decoders.clear();
                 (self.wanted, self.shown, self.mark_in, self.mark_out) = (None, None, None, None);
-                self.playing = false;
+                self.playing = self.options.play;
                 self.view = View::default();
                 self.status = "열었다".into();
             }
@@ -336,13 +346,24 @@ impl TrackcutApp {
             if ui.button("저장").on_hover_text("Ctrl+S").clicked() {
                 self.save();
             }
+            if ui.add_enabled(self.project.is_some(), egui::Button::new("내보내기")).clicked() {
+                self.export.open = true;
+            }
             ui.separator();
             if let Some(project) = &self.project {
                 let fps = project.settings.fps;
                 ui.label(RichText::new(timecode(self.playhead, fps)).monospace().size(16.0));
                 ui.label(format!("프레임 {}", floor_frame(self.playhead, fps)));
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.weak(&self.status));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.sound.pending > 0 {
+                    ui.weak(format!("소리 준비 중 ({}개 남음)", self.sound.pending));
+                } else if let Some(error) = &self.sound.engine_error {
+                    ui.weak(format!("소리 출력 불가: {error}"));
+                } else {
+                    ui.weak(&self.status);
+                }
+            });
         });
     }
 
@@ -401,7 +422,8 @@ impl TrackcutApp {
         let Some(path) = self.options.shot.clone() else { return };
         ctx.request_repaint();
         self.frames_drawn += 1;
-        let ready = self.loading.is_none() && (self.wanted.is_none() || self.shown == self.wanted);
+        let played = !self.options.play || self.playhead >= 2 * FLICKS_PER_SEC;
+        let ready = self.loading.is_none() && self.sound.pending == 0 && played && (self.wanted.is_none() || self.shown == self.wanted || self.playing);
         if !self.shot_sent && ((ready && self.frames_drawn > 10) || self.frames_drawn > 1800) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_sent = true;
@@ -424,7 +446,7 @@ impl TrackcutApp {
 
 impl eframe::App for TrackcutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.finish_loading();
+        self.finish_loading(ctx);
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
         if let Some(path) = dropped {
             self.open(ctx, path);
@@ -432,9 +454,23 @@ impl eframe::App for TrackcutApp {
         self.handle_keys(ctx);
 
         let now = Instant::now();
+        if let Some(error) = self.project.as_ref().and_then(|project| self.sound.update(project)) {
+            self.status = error;
+        }
+        if self.playing != self.sound_playing {
+            if self.playing {
+                self.sound.play(self.playhead);
+            } else {
+                self.sound.pause();
+            }
+            self.sound_playing = self.playing;
+        }
         if self.playing {
-            let elapsed = now.duration_since(self.last_tick).as_secs_f64();
-            self.playhead += secs_to_flicks(elapsed);
+            // 화면은 소리가 실제로 나간 위치를 따라간다. 출력 장치가 없으면 시계로 진행한다.
+            match self.sound.position() {
+                Some(position) => self.playhead = position,
+                None => self.playhead += secs_to_flicks(now.duration_since(self.last_tick).as_secs_f64()),
+            }
             if self.playhead >= self.duration() {
                 self.playhead = self.duration();
                 self.playing = false;
@@ -448,7 +484,7 @@ impl eframe::App for TrackcutApp {
         egui::TopBottomPanel::bottom("timeline").resizable(true).default_height(300.0).show(ctx, |ui| {
             let Some(project) = &self.project else { return };
             let marks = Marks { playhead: self.playhead, range: (self.mark_in, self.mark_out) };
-            if let Some(t) = timeline::show(ui, project, &mut self.view, &marks) {
+            if let Some(t) = timeline::show(ui, project, &mut self.view, &marks, &self.sound.waves) {
                 self.playhead = project.snap(t).clamp(0, project.duration());
                 self.playing = false;
             }
@@ -460,6 +496,8 @@ impl eframe::App for TrackcutApp {
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| self.preview(ui));
 
+        let project_path = self.project_path.clone();
+        self.export.show(ctx, self.project.as_ref(), &project_path);
         self.handle_shot(ctx);
     }
 }

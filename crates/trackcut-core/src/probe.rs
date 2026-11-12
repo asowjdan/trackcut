@@ -142,7 +142,8 @@ fn stream_title(s: &Value) -> Option<String> {
         .iter()
         .filter_map(|k| tags.get(*k)?.as_str())
         .map(str::trim)
-        .find(|t| !t.is_empty() && *t != "SoundHandler")
+        // 녹화 프로그램이 자동으로 넣는 이름은 이름표로 치지 않는다
+        .find(|t| !t.is_empty() && !["SoundHandler", "OBS Audio Handler"].contains(t))
         .map(str::to_string)
 }
 
@@ -159,7 +160,9 @@ fn build_grid(
         .filter_map(|line| {
             let mut fields = line.split(',');
             let pts = fields.next()?.trim().parse().ok()?;
-            Some((pts, fields.next().is_some_and(|f| f.contains('K'))))
+            let flags = fields.next().unwrap_or("");
+            // 'D'(discard)는 화면에 나오지 않는 패킷이다. OBS가 파일 끝에 하나 남긴다.
+            (!flags.contains('D')).then_some((pts, flags.contains('K')))
         })
         .collect();
     // 패킷은 디코딩 순서라서(B 프레임) 표시 순서로 정렬한다
@@ -187,12 +190,14 @@ fn build_grid(
     }
 
     // time_base가 거칠어서(예: 1/1000) 간격이 16·17로 흔들리는 고정 fps 파일
-    let tick = ts_to_flicks(1, tb);
+    // 허용 오차는 time_base 한 칸이되 1/4프레임을 넘지 않는다. 그보다 크게 벗어나면 녹화 중
+    // 프레임이 빠진 것(드롭)이므로 실제 프레임 시각을 그대로 쓴다.
+    let tolerance = ts_to_flicks(1, tb).min(frame_time(1, fps) / 4);
     let pts: Vec<Flicks> = packets.iter().map(|p| ts_to_flicks(p.0, tb)).collect();
     let near_cfr = pts
         .iter()
         .enumerate()
-        .all(|(i, &t)| (t - start - frame_time(i as i64, fps)).abs() <= tick);
+        .all(|(i, &t)| (t - start - frame_time(i as i64, fps)).abs() <= tolerance);
     if near_cfr {
         return (FrameGrid::Cfr { start, fps, count }, keyframes);
     }
@@ -237,6 +242,34 @@ mod tests {
         let grid = info.video.unwrap().grid;
         assert!(!grid.is_cfr());
         assert_eq!(grid.count(), 4);
+    }
+
+    #[test]
+    fn dropped_frame_is_not_mistaken_for_constant_rate() {
+        // time_base 1/60에서 프레임 하나가 빠진 녹화본: 0, 1, 2, 4, 5
+        let streams = STREAMS.replace("1/15360", "1/60");
+        let info = parse_media("a.mp4", &streams, "0,K__\n1,___\n2,___\n4,___\n5,___\n").unwrap();
+        let grid = info.video.unwrap().grid;
+        assert!(!grid.is_cfr());
+        let frame = frame_time(1, Rational::new(60, 1));
+        assert_eq!(grid.time_of(3), 4 * frame);
+        assert_eq!(grid.end(), 6 * frame);
+    }
+
+    #[test]
+    fn discard_packets_are_not_frames() {
+        // OBS 녹화본의 끝: 표시되지 않는 패킷(_D_)이 한 칸 건너뛴 시각에 있다
+        let streams = STREAMS.replace("1/15360", "1/60");
+        let info = parse_media("a.mp4", &streams, "0,K__\n1,___\n4,_D_\n2,___\n").unwrap();
+        assert_eq!(info.video.unwrap().grid, FrameGrid::Cfr { start: 0, fps: Rational::new(60, 1), count: 3 });
+    }
+
+    #[test]
+    fn coarse_time_base_jitter_is_still_constant_rate() {
+        // time_base 1/1000의 60fps: 간격이 16·17로 흔들린다
+        let streams = STREAMS.replace("1/15360", "1/1000");
+        let info = parse_media("a.mkv", &streams, "0,K__\n17,___\n33,___\n50,___\n67,___\n").unwrap();
+        assert!(info.video.unwrap().grid.is_cfr());
     }
 
     #[test]

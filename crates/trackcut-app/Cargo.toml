@@ -11,4 +11,5 @@ path = "src/main.rs"
 [dependencies]
 trackcut-core = { path = "../trackcut-core" }
 eframe = "0.29"
+cpal = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }

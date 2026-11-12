@@ -41,3 +41,11 @@ pub struct MediaInfo {
     pub video: Option<VideoStream>,
     pub audio: Vec<AudioStream>,
 }
+
+impl MediaInfo {
+    /// 파일에서 가장 먼저 시작하는 스트림의 시각. ffmpeg는 이 시각을 0으로 보고 자르고 탐색한다.
+    pub fn file_start(&self) -> Flicks {
+        let video = self.video.iter().map(|v| v.grid.start());
+        self.audio.iter().map(|a| a.start).chain(video).min().unwrap_or(0)
+    }
+}

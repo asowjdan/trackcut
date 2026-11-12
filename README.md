@@ -10,7 +10,9 @@ OBS로 게임을 녹화하면 게임, 마이크, 통화 소리가 각각 다른 
 
 화면까지 전부 Rust로 만든다. 편집 화면(`trackcut-app`)과 명령줄 도구(`trackcut`)가 있다.
 
-- **편집 화면**: 위쪽 미리보기, 아래쪽 타임라인, 오른쪽 믹서. 프레임 단위 이동, 휠 확대·축소, 분할, 구간 삭제, 되돌리기를 지원한다. 소리 재생은 아직 없다.
+- **편집 화면**: 위쪽 미리보기, 아래쪽 타임라인, 오른쪽 믹서. 프레임 단위 이동, 휠 확대·축소, 분할, 구간 삭제, 되돌리기를 지원한다.
+- **소리 재생과 파형**: 트랙별 볼륨·음소거·솔로가 재생에 바로 반영되고, 타임라인에 트랙별 파형이 보인다. 화면은 소리가 실제로 나간 위치를 따라간다.
+- **내보내기**: 섞어서 하나로(MP4 + AAC 320k), 트랙을 각각 담은 다중 트랙 MP4, 트랙별 WAV. NVENC를 쓰고 안 되면 x264로 바꾼다. 진행률·남은 시간·취소를 지원하고, 기존 파일은 덮어쓰지 않는다. 지금은 전체를 다시 인코딩한다.
 - **프레임 정확한 미리보기**: 요청한 프레임 번호와 화면에 나오는 프레임이 정확히 일치한다(테스트로 확인).
 
 - **미디어 분석**: `ffprobe`로 트랙 수, 실제 프레임 시각, 키프레임 위치, 트랙별 시작 시각을 읽는다. 프레임 간격이 고르지 않은 파일(VFR)도 실제 프레임에 맞춘다.
@@ -38,6 +40,7 @@ trackcut split 녹화.tagged.trackcut.json 00:12:03:30
 trackcut delete 녹화.tagged.trackcut.json 90f 150f
 trackcut delete 녹화.tagged.trackcut.json 10.5 12 --tracks 3 --keep-gap
 trackcut show 녹화.tagged.trackcut.json
+trackcut export 녹화.tagged.trackcut.json --audio mix --quality high
 ```
 
 시각은 `90f`(프레임), `00:12:03:30`(시:분:초:프레임), `12.5`(초)로 쓰고, 자동으로 프레임 경계에 붙는다.
@@ -73,10 +76,10 @@ trackcut-app 녹화.tagged.mp4
 
 ## 앞으로 할 것
 
-1. 소리 재생, 파형과 썸네일, 클립 드래그(트림·이동)
+1. 클립 선택과 드래그(트림·이동), 연결 해제, 썸네일, 자동 저장
 2. 트랙별 노이즈 제거와 음성 보정(FFmpeg 필터)
 3. 다른 파일 추가와 화면 전환 효과
-4. 스마트 렌더 내보내기: 손대지 않은 구간은 원본을 그대로 복사하고 바뀐 구간만 다시 인코딩
+4. 스마트 렌더: 손대지 않은 구간은 원본을 그대로 복사하고 바뀐 구간만 다시 인코딩
 5. AI 조작(MCP): AI가 편집기를 조작하고 그 과정을 화면에 표시
 
 ## 개인정보 보호
@@ -95,7 +98,7 @@ git config core.hooksPath .githooks
 ## 사용한 오픈소스
 
 - [FFmpeg](https://ffmpeg.org): 분석, 디코딩, 필터, 인코딩
-- [Rust](https://www.rust-lang.org), [serde](https://serde.rs), [egui / eframe](https://github.com/emilk/egui)
+- [Rust](https://www.rust-lang.org), [serde](https://serde.rs), [egui / eframe](https://github.com/emilk/egui), [cpal](https://github.com/RustAudio/cpal)
 
 ## 라이선스
 

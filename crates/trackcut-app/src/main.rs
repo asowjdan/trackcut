@@ -2,13 +2,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod engine;
+mod export_ui;
+mod sound;
 mod timeline;
 
 use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 실행 인자: `trackcut-app [미디어 또는 프로젝트] [--seek 시각] [--shot 화면캡처.png]`
+/// 실행 인자: `trackcut-app [미디어 또는 프로젝트] [--seek 시각] [--play] [--shot 화면캡처.png]`
 #[derive(Default)]
 pub struct Options {
     pub input: Option<PathBuf>,
@@ -16,6 +19,8 @@ pub struct Options {
     pub seek: Option<String>,
     /// 화면을 한 번 그린 뒤 이 경로에 PNG로 저장하고 끝낸다(화면 확인용)
     pub shot: Option<PathBuf>,
+    /// 열자마자 재생한다. `--shot`과 함께 쓰면 2초 재생한 뒤의 화면을 저장한다(재생 확인용)
+    pub play: bool,
 }
 
 fn parse_options() -> Options {
@@ -25,6 +30,7 @@ fn parse_options() -> Options {
         match arg.as_str() {
             "--seek" => options.seek = args.next(),
             "--shot" => options.shot = args.next().map(PathBuf::from),
+            "--play" => options.play = true,
             _ => options.input = Some(PathBuf::from(arg)),
         }
     }

@@ -4,6 +4,8 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, Sense, Strok
 use trackcut_core::project::{Project, TrackKind};
 use trackcut_core::time::{flicks_to_secs, secs_to_flicks, timecode, Flicks};
 
+use crate::sound::Waves;
+
 const HEADER_WIDTH: f32 = 130.0;
 const RULER_HEIGHT: f32 = 24.0;
 const ROW_HEIGHT: f32 = 36.0;
@@ -31,7 +33,7 @@ pub struct Marks {
 }
 
 /// 타임라인을 그린다. 사용자가 클릭하거나 드래그한 시각이 있으면 돌려준다(프레임 맞춤 전).
-pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks) -> Option<Flicks> {
+pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks, waves: &Waves) -> Option<Flicks> {
     let rows = project.timeline.tracks.len().max(1) as f32;
     let size = vec2(ui.available_width(), (RULER_HEIGHT + rows * ROW_HEIGHT).max(ui.available_height()));
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -87,7 +89,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
         };
         lanes.line_segment(
             [pos2(lane.left(), top + ROW_HEIGHT), pos2(lane.right(), top + ROW_HEIGHT)],
-            Stroke::new(1.0_f32,style.faint_bg_color),
+            Stroke::new(1.0_f32, style.faint_bg_color),
         );
         for clip in project.timeline.clips.iter().filter(|c| c.track == track.id) {
             let (left, right) = (x_of(clip.start), x_of(clip.end()));
@@ -96,7 +98,12 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
             }
             let body = Rect::from_min_max(pos2(left, top + 3.0), pos2(right.max(left + 1.0), top + ROW_HEIGHT - 3.0));
             lanes.rect_filled(body, 3.0, color);
-            lanes.rect_stroke(body, 3.0, Stroke::new(1.0_f32,Color32::from_black_alpha(140)));
+            lanes.rect_stroke(body, 3.0, Stroke::new(1.0_f32, Color32::from_black_alpha(140)));
+            if let Some((peaks, stream_start)) = waves.get(&(clip.media, clip.stream)).filter(|_| track.kind == TrackKind::Audio) {
+                // 화면 왼쪽 끝 시각에서 클립 안의 원본 위치까지의 차이(초)
+                let source_at_scroll = flicks_to_secs(clip.src_in - stream_start - clip.start) + view.scroll;
+                draw_wave(&lanes, body.intersect(lane), lane.left(), view.px_per_sec, source_at_scroll, peaks);
+            }
         }
         // 트랙 이름
         let header = Rect::from_min_size(pos2(rect.left(), top), vec2(HEADER_WIDTH, ROW_HEIGHT));
@@ -138,7 +145,7 @@ fn draw_ruler(painter: &egui::Painter, lane: Rect, view: &View, project: &Projec
         let mut n = (view.scroll / frame).floor();
         while x_of(n * frame) <= lane.right() {
             let x = x_of(n * frame);
-            painter.line_segment([pos2(x, lane.top() + RULER_HEIGHT), pos2(x, lane.bottom())], Stroke::new(1.0_f32,Color32::from_gray(45)));
+            painter.line_segment([pos2(x, lane.top() + RULER_HEIGHT), pos2(x, lane.bottom())], Stroke::new(1.0_f32, Color32::from_gray(45)));
             n += 1.0;
         }
     }
@@ -146,7 +153,7 @@ fn draw_ruler(painter: &egui::Painter, lane: Rect, view: &View, project: &Projec
     while x_of(n * step) <= lane.right() {
         let secs = n * step;
         let x = x_of(secs);
-        painter.line_segment([pos2(x, lane.top()), pos2(x, lane.top() + RULER_HEIGHT)], Stroke::new(1.0_f32,Color32::from_gray(110)));
+        painter.line_segment([pos2(x, lane.top()), pos2(x, lane.top() + RULER_HEIGHT)], Stroke::new(1.0_f32, Color32::from_gray(110)));
         painter.text(
             pos2(x + 4.0, lane.top() + RULER_HEIGHT * 0.5),
             Align2::LEFT_CENTER,
@@ -155,5 +162,26 @@ fn draw_ruler(painter: &egui::Painter, lane: Rect, view: &View, project: &Projec
             text_color,
         );
         n += 1.0;
+    }
+}
+
+/// 클립 안에 파형을 그린다. 화면 1px마다 그 구간에서 가장 큰 소리 크기를 세로선으로 표시한다.
+fn draw_wave(painter: &egui::Painter, area: Rect, lane_left: f32, px_per_sec: f32, source_at_scroll: f64, peaks: &[u8]) {
+    const PEAKS_PER_SEC: f64 = 100.0;
+    let color = Color32::from_rgba_unmultiplied(220, 255, 235, 150);
+    let half = area.height() * 0.5 - 2.0;
+    let mut x = area.left().floor();
+    while x < area.right() {
+        let source = source_at_scroll + ((x - lane_left) / px_per_sec) as f64;
+        let first = (source * PEAKS_PER_SEC).max(0.0) as usize;
+        let last = (((source + 1.0 / px_per_sec as f64) * PEAKS_PER_SEC).ceil() as usize).max(first + 1);
+        let peak = peaks.get(first.min(peaks.len())..last.min(peaks.len())).and_then(|range| range.iter().max());
+        if let Some(&peak) = peak {
+            // 작은 소리도 보이도록 제곱근 눈금을 쓴다
+            let height = (peak as f32 / 255.0).sqrt() * half;
+            let center = area.center().y;
+            painter.line_segment([pos2(x, center - height), pos2(x, center + height.max(0.5))], Stroke::new(1.0_f32, color));
+        }
+        x += 1.0;
     }
 }

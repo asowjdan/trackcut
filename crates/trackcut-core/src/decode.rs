@@ -56,7 +56,7 @@ impl Decoder {
         }
         let height = video.height.min(max_height).max(2) & !1;
         let width = ((video.width as u64 * height as u64 / video.height as u64) as u32).max(2) & !1;
-        let file_start = info.audio.iter().map(|a| a.start).chain([video.grid.start()]).min().unwrap_or(0);
+        let file_start = info.file_start();
         let config = Config { path: PathBuf::from(&info.path), grid: video.grid.clone(), file_start, width, height };
         let (requests, request_rx) = channel();
         let (frame_tx, frames) = channel();

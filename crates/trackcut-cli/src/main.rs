@@ -19,6 +19,8 @@ const USAGE: &str = "\
   split <프로젝트> <시각>              그 시각에서 모든 클립을 나눈다
   delete <프로젝트> <시작> <끝> [--tracks 번호,...] [--keep-gap]
                                        구간을 지운다 (기본: 뒤쪽을 당겨 붙임)
+  export <프로젝트> [-o 출력] [--audio mix|tracks|wav] [--quality high|standard|small]
+                                       편집 결과를 새 파일로 내보낸다
 
 시각: 90f(프레임), 00:12:03:59(시:분:초:프레임), 12.5(초). 프레임 경계에 자동으로 붙는다.";
 
@@ -89,6 +91,7 @@ fn run(command: &str, args: Args) -> CliResult<()> {
         "show" => cmd_show(&Project::load(Path::new(args.pos(0, "프로젝트 파일")?))?),
         "split" => cmd_split(&args),
         "delete" => cmd_delete(&args),
+        "export" => cmd_export(&args),
         _ => Err(format!("모르는 명령: {command}\n\n{USAGE}").into()),
     }
 }
@@ -190,6 +193,40 @@ fn cmd_split(args: &Args) -> CliResult<()> {
     let created = project.split_at(t, None)?;
     project.save(path)?;
     println!("{}에서 클립 {}개를 나눴다", timecode(t, project.settings.fps), created.len());
+    Ok(())
+}
+
+fn cmd_export(args: &Args) -> CliResult<()> {
+    use std::io::Write;
+    use trackcut_core::export::{export, AudioMode, ExportOptions, Quality};
+
+    let path = Path::new(args.pos(0, "프로젝트 파일")?);
+    let project = Project::load(path)?;
+    let audio = match args.options.get("--audio").map(String::as_str) {
+        None | Some("mix") => AudioMode::Mix,
+        Some("tracks") => AudioMode::Tracks,
+        Some("wav") => AudioMode::WavPerTrack,
+        Some(other) => return Err(format!("--audio: mix, tracks, wav 중 하나여야 한다: {other}").into()),
+    };
+    let quality = match args.options.get("--quality").map(String::as_str) {
+        None | Some("high") => Quality::High,
+        Some("standard") => Quality::Standard,
+        Some("small") => Quality::Small,
+        Some(other) => return Err(format!("--quality: high, standard, small 중 하나여야 한다: {other}").into()),
+    };
+    let extension = if audio == AudioMode::WavPerTrack { ".wav" } else { ".export.mp4" };
+    let default_output = with_suffix(&with_suffix(path, ""), extension);
+    let output = args.options.get("-o").map_or(default_output, PathBuf::from);
+    let options = ExportOptions { audio, quality, ..ExportOptions::new(output) };
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let outputs = export(&project, &options, &cancel, |p| {
+        print!("\r내보내는 중 {:3.0}%", p * 100.0);
+        let _ = std::io::stdout().flush();
+    })?;
+    println!("\r내보내기 완료        ");
+    for file in outputs {
+        println!("{}", file.display());
+    }
     Ok(())
 }
 
