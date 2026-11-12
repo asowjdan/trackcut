@@ -39,7 +39,7 @@ trackcut show 녹화.tagged.trackcut.json
 
 시각은 `90f`(프레임), `00:12:03:30`(시:분:초:프레임), `12.5`(초)로 쓰고, 자동으로 프레임 경계에 붙는다.
 
-Windows GNU 툴체인은 경로에 한글이 있으면 링크에 실패할 수 있다. 그럴 때는 `CARGO_TARGET_DIR`을 영문 경로로 지정한다.
+프로젝트 폴더나 미디어 파일 경로에 한글이 있어도 된다. Windows GNU 툴체인의 기본 링커는 한글 경로를 열지 못해서, `.cargo/config.toml`에서 Rust에 들어 있는 lld 링커를 쓰도록 해 두었다.
 
 ## 구조
 
