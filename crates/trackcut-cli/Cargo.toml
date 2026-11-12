@@ -1,0 +1,13 @@
+[package]
+name = "trackcut-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trackcut"
+path = "src/main.rs"
+
+[dependencies]
+trackcut-core = { path = "../trackcut-core" }
+serde_json.workspace = true

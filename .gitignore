@@ -1,0 +1,10 @@
+/target
+# 녹화본, 프로젝트 파일, 개인 메모는 올리지 않는다
+*.mp4
+*.mkv
+*.wav
+*.flac
+*.tracks.json
+*.trackcut.json
+/local/
+.env

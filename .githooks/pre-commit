@@ -1,0 +1,3 @@
+#!/bin/sh
+# 개인정보·컴퓨터 정보가 들어간 커밋을 거절한다.
+exec bash "$(git rev-parse --show-toplevel)/scripts/check-private.sh"
