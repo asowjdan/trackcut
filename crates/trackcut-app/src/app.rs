@@ -7,7 +7,7 @@ mod panels;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key};
 use trackcut_core::decode::Decoder;
@@ -21,6 +21,7 @@ use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, F
 
 use crate::drag::Drag;
 use crate::export_ui::ExportUi;
+use crate::layout::{Layout, PANEL_WIDTH, TIMELINE_HEIGHT};
 use crate::regions::{play_span, Regions};
 use crate::sound::Sound;
 use crate::timeline::{self, Action, Marks, View};
@@ -101,10 +102,18 @@ pub struct TrackcutApp {
     shot_sent: bool,
     /// 실행 인자로 받은 확인용 동작을 이미 실행했는지
     startup_done: bool,
+    /// 화면 배치와, 설정 파일에 마지막으로 저장한 배치. 경로가 없으면 저장하지 않는다
+    layout: Layout,
+    layout_saved: Layout,
+    layout_path: Option<PathBuf>,
+    layout_checked: Instant,
+    /// "기본 배치로"를 누를 때마다 올려서, 패널이 기억해 둔 크기를 버리게 한다
+    layout_epoch: u32,
 }
 
 impl TrackcutApp {
-    pub fn new(ctx: egui::Context, options: Options) -> Self {
+    pub fn new(ctx: egui::Context, options: Options, saved: Layout, layout_path: Option<PathBuf>) -> Self {
+        let layout = Layout { panel_right: saved.panel_right || options.panel_right, timeline_top: saved.timeline_top || options.timeline_top, ..saved };
         let mut app = TrackcutApp {
             project: None,
             project_path: PathBuf::new(),
@@ -139,6 +148,11 @@ impl TrackcutApp {
             frames_drawn: 0,
             shot_sent: false,
             startup_done: false,
+            layout,
+            layout_saved: saved,
+            layout_path,
+            layout_checked: Instant::now(),
+            layout_epoch: 0,
             options,
         };
         app.queue.extend(std::mem::take(&mut app.options.inputs));
@@ -665,6 +679,32 @@ impl TrackcutApp {
         self.shown = Some((media, frame.frame));
     }
 
+    /// 창 크기를 배치에 적고, 배치가 바뀌었으면 설정 파일에 저장한다.
+    /// 패널을 끄는 동안에는 기다렸다가 손을 뗀 뒤에 저장한다.
+    fn keep_layout(&mut self, ctx: &egui::Context) {
+        let (size, minimized, busy) = ctx.input(|i| (i.viewport().inner_rect.map(|r| r.size()), i.viewport().minimized, i.pointer.any_down()));
+        if let Some(size) = size.filter(|s| minimized != Some(true) && s.x >= 100.0 && s.y >= 100.0) {
+            self.layout.window = [size.x, size.y];
+        }
+        let Some(path) = &self.layout_path else { return };
+        if self.layout == self.layout_saved || busy || self.layout_checked.elapsed() < Duration::from_millis(400) {
+            return;
+        }
+        self.layout_checked = Instant::now();
+        if let Err(e) = self.layout.save(path) {
+            self.status = format!("화면 배치를 저장하지 못했다: {e}");
+        }
+        // 실패해도 같은 배치로 계속 다시 시도하지는 않는다
+        self.layout_saved = self.layout;
+    }
+
+    /// 배치를 기본값으로 되돌린다.
+    pub(crate) fn reset_layout(&mut self) {
+        self.layout = self.layout.reset();
+        self.layout_epoch += 1;
+        self.status = "기본 배치로 되돌렸다".into();
+    }
+
     /// `--shot`: 화면이 준비되면 PNG로 저장하고 끝낸다.
     fn handle_shot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.options.shot.clone() else { return };
@@ -735,10 +775,25 @@ impl eframe::App for TrackcutApp {
         self.update_preview(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        egui::SidePanel::left("inspector").default_width(250.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
-        });
-        egui::TopBottomPanel::bottom("timeline").resizable(true).default_height(300.0).show(ctx, |ui| {
+        // 패널의 위치는 배치 설정을 따르고, 크기는 경계선을 끌어 바꾼다. 바뀐 크기는 배치에 적어 둔다
+        let (layout, epoch) = (self.layout, self.layout_epoch);
+        if !layout.panel_hidden {
+            let side = if layout.panel_right { egui::panel::Side::Right } else { egui::panel::Side::Left };
+            let panel = egui::SidePanel::new(side, egui::Id::new(("inspector", layout.panel_right, epoch)))
+                .resizable(true)
+                .default_width(layout.panel_width)
+                .width_range(PANEL_WIDTH.0..=PANEL_WIDTH.1);
+            let shown = panel.show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.inspector(ui));
+            });
+            self.layout.panel_width = shown.response.rect.width();
+        }
+        let side = if layout.timeline_top { egui::panel::TopBottomSide::Top } else { egui::panel::TopBottomSide::Bottom };
+        let panel = egui::TopBottomPanel::new(side, egui::Id::new(("timeline", layout.timeline_top, epoch)))
+            .resizable(true)
+            .default_height(layout.timeline_height)
+            .height_range(TIMELINE_HEIGHT.0..=TIMELINE_HEIGHT.1);
+        let shown = panel.show(ctx, |ui| {
             // 내용이 없을 때도 정해 둔 높이를 지킨다(안 그러면 패널이 내용 높이로 줄어든다)
             ui.set_min_height(ui.available_height());
             let Some(project) = &self.project else { return };
@@ -756,12 +811,14 @@ impl eframe::App for TrackcutApp {
                 self.on_timeline(action);
             }
         });
+        self.layout.timeline_height = shown.response.rect.height();
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| self.preview(ui));
 
         let project_path = self.project_path.clone();
         self.export.show(ctx, self.project.as_ref(), &project_path);
+        self.keep_layout(ctx);
         self.handle_shot(ctx);
     }
 }

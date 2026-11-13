@@ -3316,6 +3316,8 @@ dependencies = [
  "cpal",
  "eframe",
  "image",
+ "serde",
+ "serde_json",
  "trackcut-core",
 ]
 

@@ -5,6 +5,7 @@ mod app;
 mod drag;
 mod engine;
 mod export_ui;
+mod layout;
 mod regions;
 mod sound;
 mod timeline;
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 실행 인자: `trackcut-app [미디어 또는 프로젝트 ...] [--seek 시각] [--play] [--select 클립순번] [--region 시작초,끝초 ...] [--merge] [--split] [--to-edit] [--edit-view] [--crop] [--pos x,y] [--shot 화면캡처.png]`
+/// 실행 인자: `trackcut-app [미디어 또는 프로젝트 ...] [--seek 시각] [--play] [--select 클립순번] [--region 시작초,끝초 ...] [--merge] [--split] [--to-edit] [--edit-view] [--panel-right] [--timeline-top] [--crop] [--pos x,y] [--shot 화면캡처.png]`
 #[derive(Default)]
 pub struct Options {
     /// 열 파일들. 첫 파일로 프로젝트를 시작하고 나머지는 타임라인 끝에 이어 붙인다
@@ -37,6 +38,9 @@ pub struct Options {
     pub to_edit: bool,
     /// 열자마자 미리보기를 편집본 묶음으로 바꾼다
     pub edit_view: bool,
+    /// 편집 패널을 오른쪽에, 타임라인을 위에 둔다(화면 배치 확인용)
+    pub panel_right: bool,
+    pub timeline_top: bool,
     /// 열자마자 화면 자르기 편집을 켠다(`--select`로 영상 클립을 골라야 보인다)
     pub crop: bool,
     /// 창을 띄울 화면 위치 `x,y`(다른 모니터에 띄울 때)
@@ -57,6 +61,8 @@ fn parse_options() -> Options {
             "--merge" => options.merge = true,
             "--to-edit" => options.to_edit = true,
             "--edit-view" => options.edit_view = true,
+            "--panel-right" => options.panel_right = true,
+            "--timeline-top" => options.timeline_top = true,
             "--region" => {
                 let text = args.next().unwrap_or_default();
                 let mut ends = text.split(',').filter_map(|n| n.trim().parse().ok());
@@ -87,9 +93,13 @@ fn setup_fonts(ctx: &egui::Context) {
 
 fn main() -> eframe::Result {
     let options = parse_options();
+    // 화면 확인용 실행(`--shot`)은 사용자의 배치를 읽지도 고치지도 않는다.
+    // 다만 설정 폴더를 따로 지정했으면 그 폴더로 저장과 복원을 확인할 수 있다
+    let layout_path = layout::Layout::path().filter(|_| options.shot.is_none() || layout::Layout::is_overridden());
+    let layout = layout_path.as_deref().map_or_else(layout::Layout::default, layout::Layout::load);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("trackcut")
-        .with_inner_size([1280.0, 800.0])
+        .with_inner_size(layout.window)
         .with_min_inner_size([800.0, 500.0])
         // 화면 확인용 실행은 사용자의 포커스를 가져가지 않는다
         .with_active(options.shot.is_none());
@@ -102,7 +112,7 @@ fn main() -> eframe::Result {
         native,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::TrackcutApp::new(cc.egui_ctx.clone(), options)))
+            Ok(Box::new(app::TrackcutApp::new(cc.egui_ctx.clone(), options, layout, layout_path)))
         }),
     )
 }

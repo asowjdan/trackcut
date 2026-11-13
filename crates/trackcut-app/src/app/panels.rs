@@ -58,6 +58,8 @@ impl TrackcutApp {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.layout_menu(ui);
+                ui.separator();
                 if let Some(project) = &self.project {
                     let fps = project.settings.fps;
                     ui.label(format!("프레임 {}", floor_frame(self.playhead, fps)));
@@ -73,6 +75,32 @@ impl TrackcutApp {
                 };
                 ui.add(egui::Label::new(RichText::new(status).weak()).truncate());
             });
+        });
+    }
+
+    /// 화면 배치 메뉴: 패널을 어느 쪽에 둘지 고른다. 크기는 패널 사이의 경계선을 끌어 바꾼다.
+    fn layout_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("화면 배치", |ui| {
+            ui.strong("편집 패널");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.layout.panel_right, false, "왼쪽");
+                ui.selectable_value(&mut self.layout.panel_right, true, "오른쪽");
+            });
+            let mut shown = !self.layout.panel_hidden;
+            ui.checkbox(&mut shown, "편집 패널 보이기");
+            self.layout.panel_hidden = !shown;
+            ui.add_space(4.0);
+            ui.strong("타임라인");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.layout.timeline_top, false, "아래");
+                ui.selectable_value(&mut self.layout.timeline_top, true, "위");
+            });
+            ui.separator();
+            if ui.button("기본 배치로 되돌리기").clicked() {
+                self.reset_layout();
+                ui.close_menu();
+            }
+            ui.weak("패널 사이의 경계선을 끌면 크기가 바뀐다.\n배치는 자동으로 저장되어 다음에 열 때도 그대로다.");
         });
     }
 
