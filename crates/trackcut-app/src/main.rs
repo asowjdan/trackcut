@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod drag;
 mod engine;
 mod export_ui;
 mod sound;
@@ -11,7 +12,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 실행 인자: `trackcut-app [미디어 또는 프로젝트] [--seek 시각] [--play] [--shot 화면캡처.png]`
+/// 실행 인자: `trackcut-app [미디어 또는 프로젝트] [--seek 시각] [--play] [--select 클립순번] [--pos x,y] [--shot 화면캡처.png]`
 #[derive(Default)]
 pub struct Options {
     pub input: Option<PathBuf>,
@@ -21,6 +22,10 @@ pub struct Options {
     pub shot: Option<PathBuf>,
     /// 열자마자 재생한다. `--shot`과 함께 쓰면 2초 재생한 뒤의 화면을 저장한다(재생 확인용)
     pub play: bool,
+    /// 열자마자 이 순번(0부터)의 클립을 선택한다(선택 표시 확인용)
+    pub select: Option<usize>,
+    /// 창을 띄울 화면 위치 `x,y`(다른 모니터에 띄울 때)
+    pub pos: Option<[f32; 2]>,
 }
 
 fn parse_options() -> Options {
@@ -31,6 +36,12 @@ fn parse_options() -> Options {
             "--seek" => options.seek = args.next(),
             "--shot" => options.shot = args.next().map(PathBuf::from),
             "--play" => options.play = true,
+            "--select" => options.select = args.next().and_then(|n| n.parse().ok()),
+            "--pos" => {
+                let text = args.next().unwrap_or_default();
+                let mut xy = text.split(',').filter_map(|n| n.trim().parse().ok());
+                options.pos = xy.next().zip(xy.next()).map(|(x, y)| [x, y]);
+            }
             _ => options.input = Some(PathBuf::from(arg)),
         }
     }
@@ -51,12 +62,15 @@ fn setup_fonts(ctx: &egui::Context) {
 
 fn main() -> eframe::Result {
     let options = parse_options();
-    let viewport = egui::ViewportBuilder::default()
+    let mut viewport = egui::ViewportBuilder::default()
         .with_title("trackcut")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([800.0, 500.0])
         // 화면 확인용 실행은 사용자의 포커스를 가져가지 않는다
         .with_active(options.shot.is_none());
+    if let Some(pos) = options.pos {
+        viewport = viewport.with_position(pos);
+    }
     let native = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "trackcut",

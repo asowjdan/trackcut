@@ -14,9 +14,10 @@ use trackcut_core::probe::probe;
 use trackcut_core::project::{Clip, Project, TrackKind, VOLUME_MAX_DB, VOLUME_MIN_DB};
 use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, timecode, Flicks, FLICKS_PER_SEC};
 
+use crate::drag::Drag;
 use crate::export_ui::ExportUi;
 use crate::sound::Sound;
-use crate::timeline::{self, Marks, View};
+use crate::timeline::{self, Action, Marks, View};
 use crate::Options;
 
 /// 미리보기는 이 높이 이하로 줄여서 디코딩한다.
@@ -62,6 +63,10 @@ pub struct TrackcutApp {
     view: View,
     mark_in: Option<Flicks>,
     mark_out: Option<Flicks>,
+    selected_clip: Option<u64>,
+    selected_track: Option<u64>,
+    /// 타임라인에서 클립을 끄는 중인 편집
+    drag: Option<Drag>,
     decoders: HashMap<u64, Decoder>,
     texture: Option<egui::TextureHandle>,
     /// 지금 보여야 하는 (미디어, 프레임)과 실제로 화면에 올라온 것
@@ -89,6 +94,9 @@ impl TrackcutApp {
             view: View::default(),
             mark_in: None,
             mark_out: None,
+            selected_clip: None,
+            selected_track: None,
+            drag: None,
             decoders: HashMap::new(),
             texture: None,
             wanted: None,
@@ -130,6 +138,10 @@ impl TrackcutApp {
                 };
                 self.options.seek = None;
                 self.sound.load(&project, ctx);
+                let selected = self.options.select.and_then(|n| project.timeline.clips.get(n));
+                self.selected_clip = selected.map(|c| c.id);
+                self.selected_track = selected.map(|c| c.track);
+                self.drag = None;
                 self.project = Some(project);
                 self.project_path = path;
                 self.history = History::default();
@@ -218,6 +230,68 @@ impl TrackcutApp {
         }
     }
 
+    /// 선택한 트랙(없으면 선택한 클립의 트랙)의 음소거를 켜고 끈다.
+    fn toggle_mute(&mut self) {
+        let track = self.project.as_ref().zip(self.selected_track).and_then(|(p, id)| p.track(id));
+        let Some((id, muted)) = track.map(|t| (t.id, t.muted)) else {
+            self.status = "트랙을 먼저 선택한다".into();
+            return;
+        };
+        self.edit(if muted { "음소거 해제" } else { "음소거" }, |p| p.set_muted(id, !muted));
+    }
+
+    /// 선택한 클립이 다른 클립과 연결돼 있는지.
+    fn selection_linked(&self) -> bool {
+        let clip = self.project.as_ref().zip(self.selected_clip).and_then(|(p, id)| p.clip(id).ok());
+        clip.is_some_and(|c| c.link.is_some())
+    }
+
+    fn unlink(&mut self) {
+        if !self.selection_linked() {
+            self.status = "연결된 클립을 먼저 선택한다".into();
+            return;
+        }
+        if let Some(id) = self.selected_clip {
+            self.edit("연결 해제", |p| p.unlink(id));
+        }
+    }
+
+    fn on_timeline(&mut self, action: Action) {
+        let Some(project) = self.project.as_mut() else { return };
+        match action {
+            Action::Seek(t) => {
+                self.playhead = project.snap(t).clamp(0, project.duration());
+                self.playing = false;
+            }
+            Action::SelectClip(id) => {
+                self.selected_clip = Some(id);
+                self.selected_track = project.clip(id).ok().map(|c| c.track);
+            }
+            Action::SelectTrack(id) => (self.selected_clip, self.selected_track) = (None, Some(id)),
+            Action::Deselect => (self.selected_clip, self.selected_track) = (None, None),
+            Action::DragStart(clip, grab) => self.drag = Some(Drag::begin(project, clip, grab)),
+            Action::DragTo(t) => {
+                if let Some(drag) = &mut self.drag {
+                    drag.update(project, t);
+                }
+            }
+            Action::DragEnd => {
+                if let Some(drag) = self.drag.take() {
+                    let label = drag.grab.label();
+                    match drag.finish(project, &mut self.history) {
+                        Ok(true) => self.status = label.into(),
+                        Ok(false) => {}
+                        Err(e) => self.status = e.to_string(),
+                    }
+                    self.seek(self.playhead);
+                }
+            }
+            Action::Rename(track, name) => {
+                self.edit("트랙 이름 바꾸기", |p| p.rename_track(track, &name));
+            }
+        }
+    }
+
     fn undo(&mut self) {
         if let Some(project) = self.project.as_mut() {
             self.status = self.history.undo(project).map_or("되돌릴 것이 없다".into(), |l| format!("되돌림: {l}"));
@@ -266,6 +340,12 @@ impl TrackcutApp {
         }
         if pressed(Key::Delete) {
             self.delete_marked();
+        }
+        if pressed(Key::M) {
+            self.toggle_mute();
+        }
+        if pressed(Key::U) {
+            self.unlink();
         }
         if command && pressed(Key::Z) {
             self.undo();
@@ -335,6 +415,9 @@ impl TrackcutApp {
             }
             if ui.button("구간 삭제").on_hover_text("Delete").clicked() {
                 self.delete_marked();
+            }
+            if ui.add_enabled(self.selection_linked(), egui::Button::new("연결 해제")).on_hover_text("U").clicked() {
+                self.unlink();
             }
             ui.separator();
             if ui.add_enabled(self.history.can_undo(), egui::Button::new("되돌리기")).on_hover_text("Ctrl+Z").clicked() {
@@ -483,10 +566,14 @@ impl eframe::App for TrackcutApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         egui::TopBottomPanel::bottom("timeline").resizable(true).default_height(300.0).show(ctx, |ui| {
             let Some(project) = &self.project else { return };
-            let marks = Marks { playhead: self.playhead, range: (self.mark_in, self.mark_out) };
-            if let Some(t) = timeline::show(ui, project, &mut self.view, &marks, &self.sound.waves) {
-                self.playhead = project.snap(t).clamp(0, project.duration());
-                self.playing = false;
+            let marks = Marks {
+                playhead: self.playhead,
+                range: (self.mark_in, self.mark_out),
+                clip: self.selected_clip,
+                track: self.selected_track,
+            };
+            for action in timeline::show(ui, project, &mut self.view, &marks, &self.sound.waves) {
+                self.on_timeline(action);
             }
         });
         egui::SidePanel::right("mixer").default_width(230.0).show(ctx, |ui| {
