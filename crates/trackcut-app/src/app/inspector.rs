@@ -19,8 +19,8 @@ pub enum Tab {
     Keys,
 }
 
-const KEYS: [(&str, &str); 16] = [
-    ("Space", "재생 / 정지"),
+const KEYS: [(&str, &str); 18] = [
+    ("Space", "재생 / 정지 (구역을 선택했으면 그 구역의 끝까지만)"),
     ("← / →", "1프레임 이동"),
     ("Shift + ← / →", "1초 이동"),
     ("I / O", "선택한 구역의 시작 / 끝을 지금 위치로"),
@@ -32,6 +32,8 @@ const KEYS: [(&str, &str); 16] = [
     ("Ctrl+휠 / 휠", "타임라인 확대·축소 / 좌우 이동"),
     ("타임라인 두 번 누르기", "구역 만들기"),
     ("구역 선 끌기", "구역 조절"),
+    ("Shift + 구역 누르기", "구역 여러 개 선택"),
+    ("여러 구역 우클릭", "병합"),
     ("구역·클립 우클릭", "분할, 삭제, 순서 바꾸기"),
     ("클립 가운데 끌기", "이동"),
     ("클립 양 끝 끌기", "트림"),
@@ -124,19 +126,20 @@ impl TrackcutApp {
         let Some(project) = &self.project else { return };
         let fps = project.settings.fps;
         ui.strong("구역");
-        if self.regions.is_empty() {
+        if self.regions.list().is_empty() {
             ui.weak("타임라인을 두 번 누르면 구역이 생긴다. 선을 끌어 조절하고, 우클릭으로 분할·삭제한다");
             return;
         }
         let mut action = None;
-        for (index, &(a, b)) in self.regions.iter().enumerate() {
+        let several = self.regions.picked().len() >= 2;
+        for (index, &(a, b)) in self.regions.list().iter().enumerate() {
             ui.horizontal(|ui| {
                 let name = format!("구역 {}  {} ~ {}", index + 1, timecode(a, fps), timecode(b, fps));
-                if ui.selectable_label(self.region == Some(index), name).clicked() {
-                    action = Some(Action::SelectRegion(index));
+                if ui.selectable_label(self.regions.is_picked(index), name).clicked() {
+                    action = Some(Action::SelectRegion(index, ui.input(|i| i.modifiers.shift)));
                 }
             });
-            if self.region == Some(index) {
+            if !several && self.regions.is_picked(index) {
                 ui.horizontal(|ui| {
                     if ui.small_button("분할").on_hover_text("구역의 양 끝에서 클립을 나눈다").clicked() {
                         action = Some(Action::SplitRegion(index));
@@ -149,6 +152,14 @@ impl TrackcutApp {
                     }
                 });
             }
+        }
+        if several {
+            let count = self.regions.picked().len();
+            if ui.button(format!("선택한 구역 {count}개 병합")).on_hover_text("가장 이른 시작부터 가장 늦은 끝까지를 하나의 구역으로 합친다").clicked() {
+                action = Some(Action::MergeRegions);
+            }
+        } else if self.regions.picked().len() == 1 {
+            ui.weak("재생하면 이 구역의 끝에서 멈춘다. Shift를 누른 채 다른 구역을 누르면 함께 선택된다");
         }
         if let Some(action) = action {
             self.on_timeline(action);

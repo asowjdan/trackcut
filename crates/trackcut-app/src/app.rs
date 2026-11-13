@@ -20,8 +20,9 @@ use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, F
 
 use crate::drag::Drag;
 use crate::export_ui::ExportUi;
+use crate::regions::{play_span, Regions};
 use crate::sound::Sound;
-use crate::timeline::{self, Action, Marks, Region, View};
+use crate::timeline::{self, Action, Marks, View};
 use crate::Options;
 
 /// 미리보기 화질 선택지: (디코딩할 최대 높이, 이름). 원본은 줄이지 않는다.
@@ -70,11 +71,12 @@ pub struct TrackcutApp {
     queue: VecDeque<PathBuf>,
     playhead: Flicks,
     playing: bool,
+    /// 재생을 멈출 위치(구역을 선택한 채 재생하면 그 구역의 끝)
+    play_until: Option<Flicks>,
     last_tick: Instant,
     view: View,
-    /// 타임라인에 지정한 구역들과 선택한 구역
-    regions: Vec<Region>,
-    region: Option<usize>,
+    /// 타임라인에 지정한 구역들과 그 선택
+    regions: Regions,
     /// 미리보기에서 화면 자르기를 고치는 중
     crop_mode: bool,
     /// 소리 보정 설정과 진행 중인 보정 작업
@@ -101,6 +103,8 @@ pub struct TrackcutApp {
     export: ExportUi,
     frames_drawn: u32,
     shot_sent: bool,
+    /// 실행 인자로 받은 확인용 동작을 이미 실행했는지
+    startup_done: bool,
 }
 
 impl TrackcutApp {
@@ -114,10 +118,10 @@ impl TrackcutApp {
             queue: VecDeque::new(),
             playhead: 0,
             playing: false,
+            play_until: None,
             last_tick: Instant::now(),
             view: View::default(),
-            regions: Vec::new(),
-            region: None,
+            regions: Regions::default(),
             crop_mode: false,
             fx: AudioFx::default(),
             fx_job: None,
@@ -137,6 +141,7 @@ impl TrackcutApp {
             export: ExportUi::default(),
             frames_drawn: 0,
             shot_sent: false,
+            startup_done: false,
             options,
         };
         app.queue.extend(std::mem::take(&mut app.options.inputs));
@@ -214,14 +219,14 @@ impl TrackcutApp {
                 self.project_path = path;
                 self.history = History::default();
                 self.decoders.clear();
-                (self.wanted, self.shown, self.region) = (None, None, None);
+                (self.wanted, self.shown) = (None, None);
                 self.regions.clear();
                 self.crop_mode = self.options.crop;
                 for [a, b] in self.options.regions.clone() {
-                    self.regions.push((secs_to_flicks(a), secs_to_flicks(b)));
-                    self.region = Some(0);
+                    self.regions.add((secs_to_flicks(a), secs_to_flicks(b)));
                 }
-                self.playing = self.options.play;
+                self.regions.select(0, false);
+                (self.playing, self.startup_done) = (false, false);
                 self.view = View::default();
                 self.status = "열었다".into();
             }
@@ -232,11 +237,21 @@ impl TrackcutApp {
     /// 실행 인자로 받은 확인용 동작. 파일을 전부 올린 뒤에 한 번 실행한다.
     fn startup_actions(&mut self) {
         let idle = self.loading.is_none() && self.adding.is_none() && self.queue.is_empty();
-        if !idle || self.project.is_none() {
+        if !idle || self.project.is_none() || self.startup_done {
             return;
         }
-        if std::mem::take(&mut self.options.split) {
+        self.startup_done = true;
+        if self.options.merge {
+            for index in 0..self.regions.list().len() {
+                self.regions.select(index, index > 0);
+            }
+            self.on_timeline(Action::MergeRegions);
+        }
+        if self.options.split {
             self.split_region(0);
+        }
+        if self.options.play {
+            self.start_play();
         }
     }
 
@@ -279,10 +294,18 @@ impl TrackcutApp {
     }
 
     fn toggle_play(&mut self) {
-        if self.playhead >= self.duration() {
-            self.playhead = 0;
+        if self.playing || self.project.is_none() {
+            self.playing = false;
+        } else {
+            self.start_play();
         }
-        self.playing = !self.playing && self.project.is_some();
+    }
+
+    /// 재생을 시작한다. 구역을 선택해 두었으면 그 구역의 끝에서 멈춘다.
+    fn start_play(&mut self) {
+        let region = self.regions.current().and_then(|i| self.regions.get(i));
+        (self.playhead, self.play_until) = play_span(self.playhead, region, self.duration());
+        self.playing = true;
     }
 
     /// 편집 하나를 실행하고 Undo 단계로 남긴다.
@@ -318,7 +341,7 @@ impl TrackcutApp {
     /// 구역의 양 끝에서 클립을 나눠, 구역 안쪽이 따로 떨어진 하나의 구간이 되게 한다.
     /// 구역이 여러 영상에 걸쳐 있어도 그 안의 조각들은 한 묶음으로 선택되고 움직인다.
     fn split_region(&mut self, index: usize) {
-        let Some(&(a, b)) = self.regions.get(index) else { return };
+        let Some((a, b)) = self.regions.get(index) else { return };
         let done = self.edit("구역 분할", |p| {
             let tracks = p.group_tracks(false);
             p.split_range(a, b, &tracks)
@@ -335,39 +358,23 @@ impl TrackcutApp {
 
     /// 구역의 내용을 잘라내고 뒤를 당겨 붙인다. 뒤쪽 구역들도 함께 당긴다.
     fn cut_region(&mut self, index: usize) {
-        let Some(&(a, b)) = self.regions.get(index) else {
+        let Some((a, b)) = self.regions.get(index) else {
             self.status = "삭제할 구역을 먼저 고른다".into();
             return;
         };
         if self.edit("구역 삭제", |p| p.delete_range(a, b, None, true)).is_none() {
             return;
         }
-        self.regions.remove(index);
-        for region in &mut self.regions {
-            if region.0 >= b {
-                *region = (region.0 - (b - a), region.1 - (b - a));
-            } else if region.1 > a {
-                region.1 = region.1.min(a).max(region.0);
-            }
-        }
-        self.regions.retain(|r| r.1 > r.0);
-        self.region = None;
+        self.regions.after_cut(index);
         self.seek(a);
     }
 
     /// 선택한 구역의 시작(또는 끝)을 지금 위치로 옮긴다. 선택한 구역이 없으면 지금 위치에서 2초짜리를 만든다.
     fn mark_edge(&mut self, is_end: bool) {
         let (t, total, span) = (self.playhead, self.duration(), 2 * FLICKS_PER_SEC);
-        match self.region.and_then(|i| self.regions.get_mut(i)) {
-            Some(region) if is_end => region.1 = t.max(region.0),
-            Some(region) => region.0 = t.min(region.1),
-            None => {
-                let region = if is_end { ((t - span).max(0), t) } else { (t, (t + span).min(total)) };
-                if region.1 > region.0 {
-                    self.regions.push(region);
-                    self.region = Some(self.regions.len() - 1);
-                }
-            }
+        match self.regions.current() {
+            Some(index) => self.regions.set_edge(index, is_end, t),
+            None => self.regions.add(if is_end { ((t - span).max(0), t) } else { (t, (t + span).min(total)) }),
         }
     }
 
@@ -471,31 +478,17 @@ impl TrackcutApp {
                     self.seek(self.playhead);
                 }
             }
-            Action::AddRegion(a, b) => {
-                let (a, b) = (project.snap(a), project.snap(b));
-                if b > a {
-                    self.regions.push((a, b));
-                    self.region = Some(self.regions.len() - 1);
-                }
-            }
-            Action::SelectRegion(index) => self.region = Some(index),
-            Action::MoveRegionEdge(index, is_end, t) => {
-                // 시작과 끝이 서로를 넘어가지 않게 한다
-                let t = project.snap(t);
-                match self.regions.get_mut(index) {
-                    Some(region) if is_end => region.1 = t.max(region.0),
-                    Some(region) => region.0 = t.min(region.1),
-                    None => {}
-                }
-            }
+            Action::AddRegion(a, b) => self.regions.add((project.snap(a), project.snap(b))),
+            Action::SelectRegion(index, extend) => self.regions.select(index, extend),
+            Action::DeselectRegions => self.regions.deselect(),
+            Action::MergeRegions => match self.regions.merge() {
+                Some(_) => self.status = "구역 병합".into(),
+                None => self.status = "Shift를 누른 채 구역을 둘 이상 고른 뒤 병합한다".into(),
+            },
+            Action::MoveRegionEdge(index, is_end, t) => self.regions.set_edge(index, is_end, project.snap(t)),
             Action::SplitRegion(index) => self.split_region(index),
             Action::CutRegion(index) => self.cut_region(index),
-            Action::RemoveRegion(index) => {
-                if index < self.regions.len() {
-                    self.regions.remove(index);
-                    self.region = None;
-                }
-            }
+            Action::RemoveRegion(index) => self.regions.remove(index),
             Action::SwapClip(id, forward) => {
                 self.edit("순서 변경", |p| p.swap_with_neighbor(id, forward));
             }
@@ -556,7 +549,7 @@ impl TrackcutApp {
             self.mark_edge(true);
         }
         if pressed(Key::Delete) {
-            self.cut_region(self.region.unwrap_or(usize::MAX));
+            self.cut_region(self.regions.current().unwrap_or(usize::MAX));
         }
         if pressed(Key::M) {
             self.toggle_mute();
@@ -647,7 +640,8 @@ impl TrackcutApp {
         let Some(path) = self.options.shot.clone() else { return };
         ctx.request_repaint();
         self.frames_drawn += 1;
-        let played = !self.options.play || self.playhead >= 2 * FLICKS_PER_SEC;
+        // 구역 재생은 구역 끝에서 멈추므로, 멈춘 뒤의 화면을 저장한다
+        let played = !self.options.play || (self.startup_done && !self.playing) || self.playhead >= 2 * FLICKS_PER_SEC;
         let ready = self.loading.is_none() && self.adding.is_none() && self.queue.is_empty() && self.sound.pending == 0 && played && (self.wanted.is_none() || self.shown == self.wanted || self.playing);
         if !self.shot_sent && ((ready && self.frames_drawn > 10) || self.frames_drawn > 1800) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
@@ -698,11 +692,14 @@ impl eframe::App for TrackcutApp {
                 Some(position) => self.playhead = position,
                 None => self.playhead += secs_to_flicks(now.duration_since(self.last_tick).as_secs_f64()),
             }
-            if self.playhead >= self.duration() {
-                self.playhead = self.duration();
+            let end = self.play_until.map_or(self.duration(), |t| t.min(self.duration()));
+            if self.playhead >= end {
+                self.playhead = end;
                 self.playing = false;
             }
             ctx.request_repaint();
+        } else {
+            self.play_until = None;
         }
         self.last_tick = now;
         self.update_preview(ctx);
@@ -716,8 +713,8 @@ impl eframe::App for TrackcutApp {
             let labels = timeline::clip_labels(project);
             let marks = Marks {
                 playhead: self.playhead,
-                regions: &self.regions,
-                region: self.region,
+                regions: self.regions.list(),
+                picked: self.regions.picked(),
                 clip: self.selected_clip,
                 track: self.selected_track,
                 labels: &labels,

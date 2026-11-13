@@ -9,6 +9,7 @@ use trackcut_core::project::{Clip, Project, TrackKind};
 use trackcut_core::time::{flicks_to_secs, secs_to_flicks, timecode, Flicks};
 
 use crate::drag::Grab;
+use crate::regions::Region;
 use crate::sound::Waves;
 
 const HEADER_WIDTH: f32 = 130.0;
@@ -27,13 +28,12 @@ const MARK_REACH: f32 = 5.0;
 const MARK_SPREAD: f32 = 60.0;
 const REGION_COLOR: Color32 = Color32::from_rgb(255, 200, 60);
 
-/// 구역: 타임라인에서 지정한 시작~끝.
-pub type Region = (Flicks, Flicks);
-
 /// 우클릭한 자리에 있던 것.
 #[derive(Clone, Copy)]
 struct Menu {
     region: Option<usize>,
+    /// 여러 개 선택한 구역 가운데 하나를 눌렀는지(병합 메뉴를 낸다)
+    merge: bool,
     clip: Option<u64>,
     time: Flicks,
 }
@@ -64,8 +64,8 @@ impl Default for View {
 pub struct Marks<'a> {
     pub playhead: Flicks,
     pub regions: &'a [Region],
-    /// 선택한 구역, 클립, 트랙
-    pub region: Option<usize>,
+    /// 선택한 구역들(마지막이 가장 최근에 고른 것), 선택한 클립과 트랙
+    pub picked: &'a [usize],
     pub clip: Option<u64>,
     pub track: Option<u64>,
     /// 클립마다 붙이는 제목(영상 번호와 분할 번호)
@@ -84,7 +84,11 @@ pub enum Action {
     DragEnd,
     Rename(u64, String),
     AddRegion(Flicks, Flicks),
-    SelectRegion(usize),
+    /// 구역을 고른다. true면 이미 고른 것에 더한다(Shift + 클릭)
+    SelectRegion(usize, bool),
+    DeselectRegions,
+    /// 선택한 구역들을 하나로 합친다
+    MergeRegions,
     /// 구역의 시작(false)이나 끝(true)을 옮긴다
     MoveRegionEdge(usize, bool, Flicks),
     /// 구역의 양 끝에서 클립을 나눈다
@@ -283,7 +287,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
 
     // 구역: 선택한 구역은 진하게, 나머지는 옅게. 클립 위에 겹쳐 보이도록 클립 다음에 그린다
     for (index, &(a, b)) in marks.regions.iter().enumerate() {
-        let active = marks.region == Some(index);
+        let active = marks.picked.contains(&index);
         let shade = Rect::from_min_max(pos2(x_of(a), lane.top()), pos2(x_of(b), lane.bottom()));
         lanes.rect_filled(shade, 0.0, Color32::from_rgba_unmultiplied(255, 200, 60, if active { 55 } else { 22 }));
         let line = if active { REGION_COLOR } else { Color32::from_rgb(170, 140, 70) };
@@ -339,14 +343,17 @@ fn interact(
     // 그 자리를 덮는 구역(선택한 구역을 먼저)
     let region_at = |p: Pos2| {
         let inside = |i: &usize| lane.contains(p) && x_of(marks.regions[*i].0) <= p.x && p.x <= x_of(marks.regions[*i].1);
-        marks.region.filter(|i| *i < marks.regions.len()).filter(inside).or_else(|| (0..marks.regions.len()).find(inside))
+        let picked = marks.picked.iter().rev().copied().filter(|i| *i < marks.regions.len());
+        picked.clone().find(inside).or_else(|| (0..marks.regions.len()).find(inside))
     };
 
     if response.drag_started() {
         if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
             if let Some(edge) = edge_at(origin) {
                 view.edge_grabbed = Some(edge);
-                actions.push(Action::SelectRegion(edge.0));
+                if !marks.picked.contains(&edge.0) {
+                    actions.push(Action::SelectRegion(edge.0, false));
+                }
             } else if let Some(hit) = clip_at(origin) {
                 let grab = hit.grab(origin);
                 let anchor = if grab == Grab::Trim(Edge::End) { hit.end } else { hit.start };
@@ -381,9 +388,12 @@ fn interact(
                 let name = project.track(track).map(|t| t.name.clone()).unwrap_or_default();
                 view.rename = Some((track, name, false));
             }
+        } else if p.x >= lane.left() && ui.input(|i| i.modifiers.shift) {
+            // Shift + 클릭: 구역을 여러 개 고른다. 재생 위치와 클립 선택은 그대로 둔다
+            actions.extend(region_at(p).map(|region| Action::SelectRegion(region, true)));
         } else if p.x >= lane.left() {
             let region = region_at(p);
-            actions.extend(region.map(Action::SelectRegion));
+            actions.push(region.map_or(Action::DeselectRegions, |region| Action::SelectRegion(region, false)));
             if let Some(hit) = clip_at(p) {
                 actions.push(Action::SelectClip(hit.clip));
             } else {
@@ -400,8 +410,13 @@ fn interact(
     }
     // 우클릭: 그 자리에 있는 구역과 클립을 기억해 메뉴에 쓴다
     if let Some(p) = response.interact_pointer_pos().filter(|p| response.secondary_clicked() && p.x >= lane.left()) {
-        let menu = Menu { region: region_at(p), clip: clip_at(p).map(|h| h.clip), time: seek_at(p.x) };
-        actions.extend(menu.region.map(Action::SelectRegion));
+        let region = region_at(p);
+        // 여러 개 고른 구역 위에서 누르면 선택을 그대로 두고 병합 메뉴를 낸다
+        let merge = marks.picked.len() >= 2 && region.is_some_and(|r| marks.picked.contains(&r));
+        let menu = Menu { region, merge, clip: clip_at(p).map(|h| h.clip), time: seek_at(p.x) };
+        if !merge {
+            actions.extend(menu.region.map(|region| Action::SelectRegion(region, false)));
+        }
         actions.extend(menu.clip.map(Action::SelectClip));
         view.menu = Some(menu);
     }
@@ -434,6 +449,10 @@ fn context_menu(response: &egui::Response, view: &View, actions: &mut Vec<Action
             }
         };
         match menu.region {
+            Some(_) if menu.merge => {
+                ui.weak("선택한 구역들");
+                item(ui, "병합 (하나의 구역으로 합치기)", Action::MergeRegions);
+            }
             Some(region) => {
                 ui.weak(format!("구역 {}", region + 1));
                 item(ui, "구역 분할", Action::SplitRegion(region));

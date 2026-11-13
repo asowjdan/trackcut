@@ -5,6 +5,7 @@ mod app;
 mod drag;
 mod engine;
 mod export_ui;
+mod regions;
 mod sound;
 mod timeline;
 
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 실행 인자: `trackcut-app [미디어 또는 프로젝트 ...] [--seek 시각] [--play] [--select 클립순번] [--region 시작초,끝초 ...] [--split] [--crop] [--pos x,y] [--shot 화면캡처.png]`
+/// 실행 인자: `trackcut-app [미디어 또는 프로젝트 ...] [--seek 시각] [--play] [--select 클립순번] [--region 시작초,끝초 ...] [--merge] [--split] [--crop] [--pos x,y] [--shot 화면캡처.png]`
 #[derive(Default)]
 pub struct Options {
     /// 열 파일들. 첫 파일로 프로젝트를 시작하고 나머지는 타임라인 끝에 이어 붙인다
@@ -21,12 +22,15 @@ pub struct Options {
     pub seek: Option<String>,
     /// 화면을 한 번 그린 뒤 이 경로에 PNG로 저장하고 끝낸다(화면 확인용)
     pub shot: Option<PathBuf>,
-    /// 열자마자 재생한다. `--shot`과 함께 쓰면 2초 재생한 뒤의 화면을 저장한다(재생 확인용)
+    /// 열자마자 재생한다. `--shot`과 함께 쓰면 2초 재생한 뒤(구역을 지정했으면 구역 끝에서 멈춘 뒤)의
+    /// 화면을 저장한다(재생 확인용)
     pub play: bool,
     /// 열자마자 이 순번(0부터)의 클립을 선택한다(선택 표시 확인용)
     pub select: Option<usize>,
     /// 열자마자 이 구역(`시작초,끝초`)들을 지정한다(구역 표시 확인용). 여러 번 쓸 수 있다
     pub regions: Vec<[f64; 2]>,
+    /// 열자마자 구역을 전부 하나로 합친다(병합 확인용)
+    pub merge: bool,
     /// 열자마자 첫 구역을 분할한다(분할 결과 확인용)
     pub split: bool,
     /// 열자마자 화면 자르기 편집을 켠다(`--select`로 영상 클립을 골라야 보인다)
@@ -46,6 +50,7 @@ fn parse_options() -> Options {
             "--select" => options.select = args.next().and_then(|n| n.parse().ok()),
             "--crop" => options.crop = true,
             "--split" => options.split = true,
+            "--merge" => options.merge = true,
             "--region" => {
                 let text = args.next().unwrap_or_default();
                 let mut ends = text.split(',').filter_map(|n| n.trim().parse().ok());
