@@ -1,11 +1,14 @@
 //! 타임라인 그리기와 조작: 휠 확대·축소, 스크롤, 재생 위치 이동, 클립·트랙 선택,
 //! 클립을 끌어 이동·트림, 구역(여러 개) 지정과 우클릭 메뉴, 트랙 이름 바꾸기.
+//!
+//! 위쪽은 원본 묶음, 아래쪽은 편집본 묶음이고 둘은 같은 시간축을 쓴다.
+//! 원본의 구간(또는 구역)을 편집본 쪽으로 끌어다 놓으면 그 자리에 복사된다.
 
 use std::collections::HashMap;
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke};
 use trackcut_core::edit::Edge;
-use trackcut_core::project::{Clip, Project, TrackKind};
+use trackcut_core::project::{Clip, Project, Track, TrackKind};
 use trackcut_core::time::{flicks_to_secs, secs_to_flicks, timecode, Flicks};
 
 use crate::drag::Grab;
@@ -15,6 +18,10 @@ use crate::sound::Waves;
 const HEADER_WIDTH: f32 = 130.0;
 const RULER_HEIGHT: f32 = 24.0;
 const ROW_HEIGHT: f32 = 46.0;
+/// 타임라인이 낮으면 트랙 줄을 이 높이까지 줄인다
+const ROW_MIN_HEIGHT: f32 = 30.0;
+/// "원본", "편집본" 묶음 이름 띠의 높이
+const GROUP_HEIGHT: f32 = 18.0;
 /// 클립 위쪽의 제목 띠 높이
 const TITLE_HEIGHT: f32 = 14.0;
 const MIN_PX_PER_SEC: f32 = 0.2;
@@ -38,6 +45,19 @@ struct Menu {
     time: Flicks,
 }
 
+/// 원본의 구간을 편집본 쪽으로 끌어 복사하는 중.
+#[derive(Clone, Copy)]
+struct Copying {
+    /// 복사할 원본 범위
+    range: Region,
+    /// "잡은 지점 − 범위의 시작"
+    offset: Flicks,
+    /// 끌기 시작할 때 잡은 클립이 있던 자리(편집본 위에 있는 동안 클립을 여기에 둔다)
+    home: Flicks,
+    /// 포인터가 편집본 위에 있으면, 놓았을 때 복사본이 시작할 시각
+    over: Option<Flicks>,
+}
+
 pub struct View {
     pub px_per_sec: f32,
     /// 화면 왼쪽 끝의 시각(초)
@@ -46,6 +66,7 @@ pub struct View {
     pub fit: bool,
     /// 클립을 끄는 중이면, 잡은 방식과 "잡은 지점 − 클립 기준점(시작 또는 끝)"
     grabbed: Option<(Grab, Flicks)>,
+    copying: Option<Copying>,
     /// 구역의 시작(false)이나 끝(true) 선을 끄는 중: (구역 번호, 끝인지)
     edge_grabbed: Option<(usize, bool)>,
     /// 눈금이나 빈 곳을 끌어 재생 위치를 옮기는 중
@@ -57,7 +78,7 @@ pub struct View {
 
 impl Default for View {
     fn default() -> Self {
-        View { px_per_sec: 50.0, scroll: 0.0, fit: true, grabbed: None, edge_grabbed: None, scrubbing: false, rename: None, menu: None }
+        View { px_per_sec: 50.0, scroll: 0.0, fit: true, grabbed: None, copying: None, edge_grabbed: None, scrubbing: false, rename: None, menu: None }
     }
 }
 
@@ -68,6 +89,8 @@ pub struct Marks<'a> {
     pub picked: &'a [usize],
     pub clip: Option<u64>,
     pub track: Option<u64>,
+    /// 미리보기가 편집본 묶음을 보여 주는 중인지(아니면 원본)
+    pub edit_view: bool,
     /// 클립마다 붙이는 제목(영상 번호와 분할 번호)
     pub labels: &'a HashMap<u64, String>,
 }
@@ -82,6 +105,10 @@ pub enum Action {
     /// 끄는 클립의 기준점(이동: 시작, 트림: 그 경계)이 가야 할 시각
     DragTo(Flicks),
     DragEnd,
+    /// 끌던 것을 없던 일로 한다
+    DragCancel,
+    /// 원본의 범위(시작, 끝)를 편집본의 이 시각에 복사한다
+    CopyToEdit(Flicks, Flicks, Flicks),
     Rename(u64, String),
     AddRegion(Flicks, Flicks),
     /// 구역을 고른다. true면 이미 고른 것에 더한다(Shift + 클릭)
@@ -93,6 +120,8 @@ pub enum Action {
     MoveRegionEdge(usize, bool, Flicks),
     /// 구역의 양 끝에서 클립을 나눈다
     SplitRegion(usize),
+    /// 구역의 원본 내용을 편집본의 맨 끝에 복사한다
+    CopyRegion(usize),
     /// 구역의 내용을 잘라내고 뒤를 당겨 붙인다
     CutRegion(usize),
     /// 구역 표시만 지운다
@@ -148,6 +177,8 @@ pub fn clip_labels(project: &Project) -> HashMap<u64, String> {
 /// 화면에 그려진 클립 하나의 위치.
 struct Hit {
     clip: u64,
+    /// 편집본 묶음의 클립인지
+    edit: bool,
     body: Rect,
     start: Flicks,
     end: Flicks,
@@ -168,10 +199,22 @@ impl Hit {
 
 /// 타임라인을 그리고, 사용자가 한 일을 돌려준다.
 pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks, waves: &Waves) -> Vec<Action> {
-    let rows = project.timeline.tracks.len().max(1) as f32;
-    let size = vec2(ui.available_width(), (RULER_HEIGHT + rows * ROW_HEIGHT).max(ui.available_height()));
+    // 세로 배치: 눈금, "원본" 띠, 원본 트랙들, "편집본" 띠, 편집본 트랙들(없으면 빈 줄 하나)
+    let source: Vec<&Track> = project.timeline.tracks.iter().filter(|t| !t.is_edit()).collect();
+    let edited: Vec<&Track> = project.timeline.tracks.iter().filter(|t| t.is_edit()).collect();
+    let rows = (source.len() + edited.len().max(1)) as f32;
+    let fixed = RULER_HEIGHT + 2.0 * GROUP_HEIGHT;
+    let row_h = ((ui.available_height() - fixed) / rows).clamp(ROW_MIN_HEIGHT, ROW_HEIGHT);
+    let size = vec2(ui.available_width(), (fixed + rows * row_h).max(ui.available_height()));
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     let rect = response.rect;
+    let source_top = rect.top() + RULER_HEIGHT;
+    let edit_top = source_top + GROUP_HEIGHT + source.len() as f32 * row_h;
+    let edit_bottom = edit_top + GROUP_HEIGHT + edited.len().max(1) as f32 * row_h;
+    let place = |tracks: &[&'_ Track], top: f32| -> Vec<(u64, f32)> {
+        tracks.iter().enumerate().map(|(row, t)| (t.id, top + GROUP_HEIGHT + row as f32 * row_h)).collect()
+    };
+    let tops: HashMap<u64, f32> = place(&source, source_top).into_iter().chain(place(&edited, edit_top)).collect();
     let lane = Rect::from_min_max(pos2(rect.left() + HEADER_WIDTH, rect.top()), rect.max);
     let duration = flicks_to_secs(project.duration()).max(0.001);
 
@@ -209,16 +252,19 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     let mut hits: Vec<Hit> = Vec::new();
     let mut headers: Vec<(u64, Rect)> = Vec::new();
 
-    for (row, track) in project.timeline.tracks.iter().enumerate() {
-        let top = rect.top() + RULER_HEIGHT + row as f32 * ROW_HEIGHT;
+    for track in &project.timeline.tracks {
+        let Some(&top) = tops.get(&track.id) else { continue };
         let audible = project.is_audible(track.id);
-        let color = match (track.kind, audible) {
-            (TrackKind::Video, _) => Color32::from_rgb(70, 110, 190),
-            (TrackKind::Audio, true) => Color32::from_rgb(60, 150, 110),
-            (TrackKind::Audio, false) => Color32::from_gray(90),
+        // 편집본 묶음은 원본과 다른 색으로 칠해 구분한다
+        let color = match (track.kind, audible, track.is_edit()) {
+            (TrackKind::Video, _, false) => Color32::from_rgb(70, 110, 190),
+            (TrackKind::Video, _, true) => Color32::from_rgb(130, 95, 190),
+            (TrackKind::Audio, true, false) => Color32::from_rgb(60, 150, 110),
+            (TrackKind::Audio, true, true) => Color32::from_rgb(45, 140, 155),
+            (TrackKind::Audio, false, _) => Color32::from_gray(90),
         };
         lanes.line_segment(
-            [pos2(lane.left(), top + ROW_HEIGHT), pos2(lane.right(), top + ROW_HEIGHT)],
+            [pos2(lane.left(), top + row_h), pos2(lane.right(), top + row_h)],
             Stroke::new(1.0_f32, style.faint_bg_color),
         );
         for clip in project.timeline.clips.iter().filter(|c| c.track == track.id) {
@@ -226,7 +272,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
             if right < lane.left() || left > lane.right() {
                 continue;
             }
-            let body = Rect::from_min_max(pos2(left, top + 3.0), pos2(right.max(left + 1.0), top + ROW_HEIGHT - 3.0));
+            let body = Rect::from_min_max(pos2(left, top + 3.0), pos2(right.max(left + 1.0), top + row_h - 3.0));
             let selected = marks.clip == Some(clip.id);
             lanes.rect_filled(body, 3.0, color);
             let content = Rect::from_min_max(pos2(body.left(), body.top() + TITLE_HEIGHT), body.max);
@@ -262,10 +308,10 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
                 Stroke::new(1.0_f32, Color32::from_black_alpha(140))
             };
             lanes.rect_stroke(body, 3.0, outline);
-            hits.push(Hit { clip: clip.id, body, start: clip.start, end: clip.end() });
+            hits.push(Hit { clip: clip.id, edit: track.is_edit(), body, start: clip.start, end: clip.end() });
         }
         // 트랙 이름
-        let header = Rect::from_min_size(pos2(rect.left(), top), vec2(HEADER_WIDTH, ROW_HEIGHT));
+        let header = Rect::from_min_size(pos2(rect.left(), top), vec2(HEADER_WIDTH, row_h));
         let selected = marks.track == Some(track.id);
         painter.rect_filled(header, 0.0, if selected { style.selection.bg_fill } else { style.panel_fill });
         let name_color = if selected {
@@ -283,6 +329,27 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
             name_color,
         );
         headers.push((track.id, header));
+    }
+
+    // 묶음 이름 띠. 미리보기가 보여 주는 묶음은 밝게 표시한다
+    let band = |top: f32, name: &str, hint: &str, watched: bool, ready: bool| {
+        let area = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), GROUP_HEIGHT));
+        let fill = match (ready, watched) {
+            (true, _) => Color32::from_rgb(110, 90, 30),
+            (false, true) => Color32::from_rgb(54, 62, 80),
+            (false, false) => Color32::from_gray(40),
+        };
+        painter.rect_filled(area, 0.0, fill);
+        let title = if watched { format!("{name}  ● 보는 중") } else { name.to_string() };
+        let color = if watched { Color32::WHITE } else { Color32::from_gray(175) };
+        painter.text(area.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, title, FontId::proportional(12.0), color);
+        painter.text(pos2(lane.left() + 6.0, area.center().y), Align2::LEFT_CENTER, hint, FontId::proportional(11.0), Color32::from_gray(150));
+    };
+    band(source_top, "원본", "", !marks.edit_view, false);
+    band(edit_top, "편집본", "원본의 구간이나 구역을 이 아래로 끌어다 놓으면 복사된다", marks.edit_view, view.copying.is_some());
+    if edited.is_empty() {
+        let empty = Rect::from_min_max(pos2(lane.left(), edit_top + GROUP_HEIGHT), pos2(lane.right(), edit_bottom));
+        lanes.text(empty.center(), Align2::CENTER_CENTER, "아직 비어 있다", FontId::proportional(12.0), Color32::from_gray(110));
     }
 
     // 구역: 선택한 구역은 진하게, 나머지는 옅게. 클립 위에 겹쳐 보이도록 클립 다음에 그린다
@@ -309,7 +376,14 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     let x = x_of(marks.playhead);
     lanes.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(2.0_f32,Color32::from_rgb(235, 70, 70)));
 
-    let mut actions = interact(ui, &response, project, view, marks, lane, &hits, &headers);
+    let mut actions = interact(ui, &response, project, view, marks, lane, edit_top, &hits, &headers);
+    // 편집본 위로 끌고 온 구간이 놓일 자리를 미리 보여 준다
+    if let Some((copy, at)) = view.copying.and_then(|copy| copy.over.map(|at| (copy, at))) {
+        let ghost = Rect::from_min_max(pos2(x_of(at), edit_top + GROUP_HEIGHT + 2.0), pos2(x_of(at + copy.range.1 - copy.range.0), edit_bottom - 2.0));
+        lanes.rect_filled(ghost, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 50));
+        lanes.rect_stroke(ghost, 3.0, Stroke::new(2.0_f32, REGION_COLOR));
+        lanes.with_clip_rect(ghost.intersect(lane)).text(ghost.left_top() + vec2(6.0, 4.0), Align2::LEFT_TOP, "여기에 복사", FontId::proportional(12.0), Color32::WHITE);
+    }
     context_menu(&response, view, &mut actions);
     rename_box(ui, view, &headers, &mut actions);
     actions
@@ -325,6 +399,7 @@ fn interact(
     view: &mut View,
     marks: &Marks,
     lane: Rect,
+    edit_top: f32,
     hits: &[Hit],
     headers: &[(u64, Rect)],
 ) -> Vec<Action> {
@@ -358,6 +433,12 @@ fn interact(
                 let grab = hit.grab(origin);
                 let anchor = if grab == Grab::Trim(Edge::End) { hit.end } else { hit.start };
                 view.grabbed = Some((grab, time_at(origin.x) - anchor));
+                // 원본 클립의 가운데를 잡았으면 편집본으로 끌어 복사할 수 있다. 구역 안을 잡았으면
+                // 그 구역을, 아니면 잡은 클립이 속한 구간(연결 묶음) 전체를 복사한다
+                view.copying = (grab == Grab::Move && !hit.edit)
+                    .then(|| region_at(origin).map(|i| marks.regions[i]).or_else(|| project.group_span(hit.clip).ok()))
+                    .flatten()
+                    .map(|range| Copying { range, offset: time_at(origin.x) - range.0, home: hit.start, over: None });
                 actions.push(Action::SelectClip(hit.clip));
                 actions.push(Action::DragStart(hit.clip, grab));
             } else if origin.x >= lane.left() {
@@ -369,14 +450,30 @@ fn interact(
         if let Some((index, is_end)) = view.edge_grabbed {
             actions.push(Action::MoveRegionEdge(index, is_end, seek_at(p.x)));
         } else if let Some((_, offset)) = view.grabbed {
-            actions.push(Action::DragTo(time_at(p.x) - offset));
+            match &mut view.copying {
+                // 편집본 위에서는 원본 클립을 제자리에 두고 복사할 자리만 따라간다
+                Some(copy) if p.y >= edit_top => {
+                    copy.over = Some((time_at(p.x) - copy.offset).max(0));
+                    actions.push(Action::DragTo(copy.home));
+                }
+                copy => {
+                    if let Some(copy) = copy {
+                        copy.over = None;
+                    }
+                    actions.push(Action::DragTo(time_at(p.x) - offset));
+                }
+            }
         } else if view.scrubbing {
             actions.push(Action::Seek(seek_at(p.x)));
         }
     }
     if response.drag_stopped() {
+        let copy = view.copying.take();
         if view.grabbed.take().is_some() {
-            actions.push(Action::DragEnd);
+            match copy.and_then(|copy| copy.over.map(|at| (copy.range, at))) {
+                Some(((a, b), at)) => actions.extend([Action::DragCancel, Action::CopyToEdit(a, b, at)]),
+                None => actions.push(Action::DragEnd),
+            }
         }
         view.scrubbing = false;
         view.edge_grabbed = None;
@@ -427,6 +524,10 @@ fn interact(
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         return actions;
     }
+    if view.copying.is_some_and(|copy| copy.over.is_some()) {
+        ui.ctx().set_cursor_icon(CursorIcon::Copy);
+        return actions;
+    }
     let grab = view.grabbed.map(|(grab, _)| grab).or_else(|| hover.and_then(|p| clip_at(p).map(|h| h.grab(p))));
     match grab {
         Some(Grab::Trim(_)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
@@ -456,6 +557,7 @@ fn context_menu(response: &egui::Response, view: &View, actions: &mut Vec<Action
             Some(region) => {
                 ui.weak(format!("구역 {}", region + 1));
                 item(ui, "구역 분할", Action::SplitRegion(region));
+                item(ui, "편집본 끝에 복사", Action::CopyRegion(region));
                 item(ui, "구역 삭제 (잘라내고 당겨 붙이기)", Action::CutRegion(region));
                 item(ui, "구역 표시만 지우기", Action::RemoveRegion(region));
             }

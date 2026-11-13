@@ -45,11 +45,10 @@ fn load(path: PathBuf) -> Loaded {
     project.map(|p| (p, project_path)).map_err(|e| e.to_string())
 }
 
-/// 시각 `t`에 화면에 보이는 영상 클립.
-fn video_at(project: &Project, t: Flicks) -> Option<(&Clip, &VideoStream)> {
-    let clip = project.timeline.clips.iter().find(|c| {
-        c.start <= t && t < c.end() && project.track(c.track).is_some_and(|track| track.kind == TrackKind::Video)
-    })?;
+/// 시각 `t`에 화면에 보이는 영상 클립. `edit`이면 편집본 묶음에서, 아니면 원본 묶음에서 찾는다.
+fn video_at(project: &Project, t: Flicks, edit: bool) -> Option<(&Clip, &VideoStream)> {
+    let shown = |track: &trackcut_core::project::Track| track.kind == TrackKind::Video && track.is_edit() == edit;
+    let clip = project.timeline.clips.iter().find(|c| c.start <= t && t < c.end() && project.track(c.track).is_some_and(shown))?;
     Some((clip, project.media_info(clip.media)?.video.as_ref()?))
 }
 
@@ -77,6 +76,8 @@ pub struct TrackcutApp {
     view: View,
     /// 타임라인에 지정한 구역들과 그 선택
     regions: Regions,
+    /// 미리보기와 소리가 편집본 묶음을 따르는 중인지(아니면 원본 묶음)
+    edit_view: bool,
     /// 미리보기에서 화면 자르기를 고치는 중
     crop_mode: bool,
     /// 소리 보정 설정과 진행 중인 보정 작업
@@ -122,6 +123,7 @@ impl TrackcutApp {
             last_tick: Instant::now(),
             view: View::default(),
             regions: Regions::default(),
+            edit_view: false,
             crop_mode: false,
             fx: AudioFx::default(),
             fx_job: None,
@@ -226,7 +228,7 @@ impl TrackcutApp {
                     self.regions.add((secs_to_flicks(a), secs_to_flicks(b)));
                 }
                 self.regions.select(0, false);
-                (self.playing, self.startup_done) = (false, false);
+                (self.playing, self.startup_done, self.edit_view) = (false, false, false);
                 self.view = View::default();
                 self.status = "열었다".into();
             }
@@ -250,6 +252,14 @@ impl TrackcutApp {
         if self.options.split {
             self.split_region(0);
         }
+        if self.options.to_edit {
+            for index in 0..self.regions.list().len() {
+                self.copy_region(index);
+            }
+        }
+        if self.options.edit_view {
+            self.watch(true);
+        }
         if self.options.play {
             self.start_play();
         }
@@ -269,7 +279,7 @@ impl TrackcutApp {
         let t = self.playhead;
         // 뒤로 갈 때는 바로 앞 프레임이 속한 클립을 기준으로 한다(클립 경계에서 멈추지 않게)
         let probe_at = if n < 0 { (t - 1).max(0) } else { t };
-        let next = match video_at(project, probe_at) {
+        let next = match video_at(project, probe_at, self.edit_view) {
             Some((clip, video)) if clip.speed_pct == 100 => {
                 let base = video.grid.frame_at(clip.src_in + (probe_at - clip.start)) as i64;
                 let frame = if n < 0 { base + n + 1 } else { base + n };
@@ -304,7 +314,10 @@ impl TrackcutApp {
     /// 재생을 시작한다. 구역을 선택해 두었으면 그 구역의 끝에서 멈춘다.
     fn start_play(&mut self) {
         let region = self.regions.current().and_then(|i| self.regions.get(i));
-        (self.playhead, self.play_until) = play_span(self.playhead, region, self.duration());
+        // 보고 있는 묶음(원본 또는 편집본)의 끝까지만 재생한다
+        let end = self.project.as_ref().map_or(0, |p| p.group_duration(self.edit_view));
+        let (from, until) = play_span(self.playhead, region, end);
+        (self.playhead, self.play_until) = (from, Some(until.unwrap_or(end)));
         self.playing = true;
     }
 
@@ -342,8 +355,9 @@ impl TrackcutApp {
     /// 구역이 여러 영상에 걸쳐 있어도 그 안의 조각들은 한 묶음으로 선택되고 움직인다.
     fn split_region(&mut self, index: usize) {
         let Some((a, b)) = self.regions.get(index) else { return };
+        let edit = self.edit_view;
         let done = self.edit("구역 분할", |p| {
-            let tracks = p.group_tracks(false);
+            let tracks = p.group_tracks(edit);
             p.split_range(a, b, &tracks)
         });
         // 나뉜 구간을 바로 고칠 수 있게 선택한다
@@ -362,11 +376,45 @@ impl TrackcutApp {
             self.status = "삭제할 구역을 먼저 고른다".into();
             return;
         };
-        if self.edit("구역 삭제", |p| p.delete_range(a, b, None, true)).is_none() {
+        // 보고 있는 묶음(원본 또는 편집본)에서만 지운다
+        let edit = self.edit_view;
+        let cut = self.edit("구역 삭제", |p| {
+            let tracks = p.group_tracks(edit);
+            p.delete_range_in(a, b, &tracks, true)
+        });
+        if cut.is_none() {
             return;
         }
         self.regions.after_cut(index);
         self.seek(a);
+    }
+
+    /// 미리보기와 소리가 따를 묶음을 바꾼다(편집본이면 true).
+    pub(crate) fn watch(&mut self, edit: bool) {
+        if self.edit_view != edit {
+            self.edit_view = edit;
+            self.playing = false;
+            self.status = if edit { "편집본을 본다".into() } else { "원본을 본다".into() };
+        }
+    }
+
+    /// 원본의 범위 `[a, b)`를 편집본의 `at`에 복사한다. `at`이 없으면 편집본의 맨 끝에 붙인다.
+    fn copy_to_edit(&mut self, a: Flicks, b: Flicks, at: Option<Flicks>) {
+        let copied = self.edit("편집본에 복사", |p| {
+            let at = at.map_or(p.group_duration(true), |t| p.snap(t));
+            p.copy_to_edit(p.snap(a), p.snap(b), at)
+        });
+        if copied.is_some() {
+            self.status = "편집본에 복사했다. 원본은 그대로다".into();
+        }
+    }
+
+    /// 구역의 원본 내용을 편집본의 맨 끝에 복사한다.
+    fn copy_region(&mut self, index: usize) {
+        match self.regions.get(index) {
+            Some((a, b)) => self.copy_to_edit(a, b, None),
+            None => self.status = "복사할 구역을 먼저 고른다".into(),
+        }
     }
 
     /// 선택한 구역의 시작(또는 끝)을 지금 위치로 옮긴다. 선택한 구역이 없으면 지금 위치에서 2초짜리를 만든다.
@@ -455,11 +503,20 @@ impl TrackcutApp {
                 self.playhead = project.snap(t).clamp(0, project.duration());
                 self.playing = false;
             }
+            // 클립이나 트랙을 고르면 미리보기도 그 묶음(원본 또는 편집본)을 따라간다
             Action::SelectClip(id) => {
                 self.selected_clip = Some(id);
                 self.selected_track = project.clip(id).ok().map(|c| c.track);
+                if let Some(edit) = project.clip(id).ok().map(|c| project.in_edit(c)) {
+                    self.watch(edit);
+                }
             }
-            Action::SelectTrack(id) => (self.selected_clip, self.selected_track) = (None, Some(id)),
+            Action::SelectTrack(id) => {
+                (self.selected_clip, self.selected_track) = (None, Some(id));
+                if let Some(edit) = project.track(id).map(|t| t.is_edit()) {
+                    self.watch(edit);
+                }
+            }
             Action::Deselect => (self.selected_clip, self.selected_track) = (None, None),
             Action::DragStart(clip, grab) => self.drag = Some(Drag::begin(project, clip, grab)),
             Action::DragTo(t) => {
@@ -478,6 +535,13 @@ impl TrackcutApp {
                     self.seek(self.playhead);
                 }
             }
+            Action::DragCancel => {
+                if let Some(drag) = self.drag.take() {
+                    drag.cancel(project);
+                }
+            }
+            Action::CopyToEdit(a, b, at) => self.copy_to_edit(a, b, Some(at)),
+            Action::CopyRegion(index) => self.copy_region(index),
             Action::AddRegion(a, b) => self.regions.add((project.snap(a), project.snap(b))),
             Action::SelectRegion(index, extend) => self.regions.select(index, extend),
             Action::DeselectRegions => self.regions.deselect(),
@@ -569,8 +633,10 @@ impl TrackcutApp {
     /// 재생 위치에 맞는 프레임을 디코더에 요청하고, 도착한 프레임을 화면 텍스처에 올린다.
     fn update_preview(&mut self, ctx: &egui::Context) {
         let Some(project) = &self.project else { return };
-        let lookup = if self.playhead >= project.duration() { self.playhead - 1 } else { self.playhead };
-        let at = video_at(project, lookup);
+        // 보고 있는 묶음의 맨 끝에서는 마지막 프레임을 보여 준다
+        let end = project.group_duration(self.edit_view);
+        let lookup = if self.playhead == end && end > 0 { self.playhead - 1 } else { self.playhead };
+        let at = video_at(project, lookup, self.edit_view);
         self.view_crop = at.map(|(clip, video)| (clip.id, clip.crop, video.width, video.height));
         let target = at.map(|(clip, video)| (clip.media, video.grid.frame_at(clip.src_at(lookup))));
         if target != self.wanted {
@@ -675,7 +741,7 @@ impl eframe::App for TrackcutApp {
         self.handle_keys(ctx);
 
         let now = Instant::now();
-        if let Some(error) = self.project.as_ref().and_then(|project| self.sound.update(project)) {
+        if let Some(error) = self.project.as_ref().and_then(|project| self.sound.update(project, self.edit_view)) {
             self.status = error;
         }
         if self.playing != self.sound_playing {
@@ -715,6 +781,7 @@ impl eframe::App for TrackcutApp {
                 playhead: self.playhead,
                 regions: self.regions.list(),
                 picked: self.regions.picked(),
+                edit_view: self.edit_view,
                 clip: self.selected_clip,
                 track: self.selected_track,
                 labels: &labels,

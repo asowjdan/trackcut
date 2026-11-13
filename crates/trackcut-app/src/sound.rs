@@ -27,7 +27,8 @@ pub struct Sound {
     loading: Option<Receiver<Prepared>>,
     /// 아직 준비 중인 트랙 수
     pub pending: usize,
-    last_timeline: Option<Timeline>,
+    /// 재생 구성을 만들 때의 타임라인과, 그때 들려주던 묶음(편집본이면 true)
+    last_timeline: Option<(Timeline, bool)>,
 }
 
 impl Sound {
@@ -66,7 +67,8 @@ impl Sound {
 
     /// 준비가 끝난 트랙을 받고, 타임라인이 바뀌었으면 재생 구성을 다시 만든다.
     /// 준비에 실패한 트랙이 있으면 오류 메시지를 돌려준다.
-    pub fn update(&mut self, project: &Project) -> Option<String> {
+    /// `edit`이 true면 편집본 묶음의 트랙만, 아니면 원본 묶음의 트랙만 들려준다.
+    pub fn update(&mut self, project: &Project, edit: bool) -> Option<String> {
         let mut error = None;
         let mut changed = false;
         let ready: Vec<Prepared> = self.loading.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
@@ -81,17 +83,17 @@ impl Sound {
                 Err(e) => error = Some(format!("소리 준비 실패: {e}")),
             }
         }
-        if changed || self.last_timeline.as_ref() != Some(&project.timeline) {
-            self.last_timeline = Some(project.timeline.clone());
+        if changed || self.last_timeline.as_ref().is_none_or(|(timeline, side)| *timeline != project.timeline || *side != edit) {
+            self.last_timeline = Some((project.timeline.clone(), edit));
             if let Some(engine) = &self.engine {
-                engine.set_plan(self.plan(project));
+                engine.set_plan(self.plan(project, edit));
             }
         }
         error
     }
 
-    fn plan(&self, project: &Project) -> Vec<PlanTrack> {
-        let audio_tracks = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio);
+    fn plan(&self, project: &Project, edit: bool) -> Vec<PlanTrack> {
+        let audio_tracks = project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.is_edit() == edit);
         audio_tracks
             .map(|track| {
                 let gain = if project.is_audible(track.id) { 10f32.powf(track.volume_db / 20.0) } else { 0.0 };

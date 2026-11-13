@@ -29,6 +29,18 @@ impl TrackcutApp {
             if ui.add_enabled(self.history.can_redo(), Button::new("다시 하기")).on_hover_text("Ctrl+Y").clicked() {
                 self.redo();
             }
+            ui.separator();
+            // 미리보기와 소리가 따를 묶음. 편집본에 올린 것이 있어야 고를 수 있다
+            let has_edit = self.project.as_ref().is_some_and(|p| p.has_edit());
+            ui.label("보기");
+            let mut edit = self.edit_view;
+            ui.add_enabled_ui(open, |ui| {
+                ui.selectable_value(&mut edit, false, "원본").on_hover_text("위쪽 원본 트랙을 보고 듣는다");
+                ui.add_enabled_ui(has_edit, |ui| {
+                    ui.selectable_value(&mut edit, true, "편집본").on_hover_text("아래쪽 편집본 트랙을 보고 듣는다. 내보내기도 편집본을 내보낸다");
+                });
+            });
+            self.watch(edit);
 
             let center = Rect::from_center_size(full.center(), vec2(236.0, full.height()));
             let layout = egui::Layout::left_to_right(egui::Align::Center);

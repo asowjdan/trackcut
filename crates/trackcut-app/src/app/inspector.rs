@@ -19,7 +19,7 @@ pub enum Tab {
     Keys,
 }
 
-const KEYS: [(&str, &str); 18] = [
+const KEYS: [(&str, &str); 19] = [
     ("Space", "재생 / 정지 (구역을 선택했으면 그 구역의 끝까지만)"),
     ("← / →", "1프레임 이동"),
     ("Shift + ← / →", "1초 이동"),
@@ -34,7 +34,8 @@ const KEYS: [(&str, &str); 18] = [
     ("구역 선 끌기", "구역 조절"),
     ("Shift + 구역 누르기", "구역 여러 개 선택"),
     ("여러 구역 우클릭", "병합"),
-    ("구역·클립 우클릭", "분할, 삭제, 순서 바꾸기"),
+    ("구역·클립 우클릭", "분할, 편집본에 복사, 삭제, 순서 바꾸기"),
+    ("원본 구간을 편집본으로 끌기", "그 자리에 복사"),
     ("클립 가운데 끌기", "이동"),
     ("클립 양 끝 끌기", "트림"),
     ("트랙 이름 두 번 누르기", "이름 바꾸기"),
@@ -143,6 +144,9 @@ impl TrackcutApp {
                 ui.horizontal(|ui| {
                     if ui.small_button("분할").on_hover_text("구역의 양 끝에서 클립을 나눈다").clicked() {
                         action = Some(Action::SplitRegion(index));
+                    }
+                    if ui.small_button("복사").on_hover_text("구역의 원본 내용을 편집본의 맨 끝에 복사한다").clicked() {
+                        action = Some(Action::CopyRegion(index));
                     }
                     if ui.small_button("삭제").on_hover_text("구역의 내용을 잘라내고 뒤를 당겨 붙인다").clicked() {
                         action = Some(Action::CutRegion(index));
@@ -345,7 +349,9 @@ impl TrackcutApp {
         let Some(project) = &self.project else { return };
         let fps = project.settings.fps;
         let clips = &project.timeline.clips;
-        let base = project.timeline.tracks.iter().find(|t| clips.iter().any(|c| c.track == t.id)).map(|t| t.id);
+        // 보고 있는 묶음(원본 또는 편집본)의 맨 위 트랙을 기준으로 한다
+        let side = project.timeline.tracks.iter().filter(|t| t.is_edit() == self.edit_view);
+        let base = side.clone().find(|t| clips.iter().any(|c| c.track == t.id)).map(|t| t.id);
         let labels = clip_labels(project);
         let mut rows: Vec<(u64, Flicks, Flicks)> = clips.iter().filter(|c| Some(c.track) == base).map(|c| (c.id, c.start, c.len())).collect();
         rows.sort_by_key(|row| row.1);

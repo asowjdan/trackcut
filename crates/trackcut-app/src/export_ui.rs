@@ -100,6 +100,11 @@ impl ExportUi {
                 });
             });
             ui.add_space(6.0);
+            ui.label(if project.has_edit() {
+                "아래쪽 편집본 트랙의 내용을 내보낸다"
+            } else {
+                "편집본이 비어 있어 위쪽 원본 트랙의 내용을 내보낸다"
+            });
             ui.weak(format!("저장 위치: {}", output_path(project_path, self.mode).display()));
             ui.add_space(6.0);
             match &self.job {

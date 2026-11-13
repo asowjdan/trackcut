@@ -74,6 +74,11 @@ impl Drag {
         Some(start + delta)
     }
 
+    /// 끌기를 없던 일로 하고 시작할 때의 상태로 돌려놓는다.
+    pub fn cancel(self, project: &mut Project) {
+        project.timeline = self.base;
+    }
+
     /// 끌기를 끝내고 결과를 Undo 한 단계로 남긴다. 바뀐 것이 있으면 true.
     pub fn finish(self, project: &mut Project, history: &mut History) -> trackcut_core::Result<bool> {
         project.timeline = self.base;
@@ -171,6 +176,19 @@ mod tests {
         let mut drag = Drag::begin(&p, clip, Grab::Move);
         drag.update(&mut p, -f(500));
         assert_eq!(spans(&p, 0), [(0, f(500))]);
+    }
+
+    #[test]
+    fn cancelled_drag_restores_the_timeline() {
+        let mut p = project();
+        p.delete_range(0, f(100), None, false).unwrap();
+        let before = p.timeline.clone();
+        let clip = p.timeline.clips[0].id;
+        let mut drag = Drag::begin(&p, clip, Grab::Move);
+        drag.update(&mut p, f(30));
+        assert_ne!(p.timeline, before);
+        drag.cancel(&mut p);
+        assert_eq!(p.timeline, before);
     }
 
     #[test]
