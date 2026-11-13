@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::labels::{default_name, TracksMeta};
 use crate::media::MediaInfo;
-use crate::time::{frame_time, nearest_frame, Flicks, FrameGrid, Rational};
+use crate::time::{floor_frame, frame_time, nearest_frame, Flicks, FrameGrid, Rational};
 
 pub const PROJECT_VERSION: u32 = 1;
 pub const VOLUME_MIN_DB: f32 = -60.0;
@@ -58,11 +58,60 @@ pub struct Clip {
     pub src_out: Flicks,
     /// 같은 번호끼리 연결돼 함께 잘리고 움직인다
     pub link: Option<u64>,
+    /// 재생 속도(%). 100이 원래 속도, 200이면 두 배 빠르다.
+    #[serde(default = "full_speed")]
+    pub speed_pct: u32,
+    /// 화면 자르기(영상 클립만 쓴다)
+    #[serde(default, skip_serializing_if = "Crop::is_none")]
+    pub crop: Crop,
+}
+
+pub const SPEED_MIN_PCT: u32 = 25;
+pub const SPEED_MAX_PCT: u32 = 400;
+
+fn full_speed() -> u32 {
+    100
+}
+
+/// 화면의 네 변에서 잘라낼 픽셀 수(원본 해상도 기준).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Crop {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl Crop {
+    pub fn is_none(&self) -> bool {
+        *self == Crop::default()
+    }
+}
+
+/// 반올림하는 정수 나눗셈(음수도 가까운 쪽으로).
+fn round_div(a: i64, b: i64) -> i64 {
+    (2 * a + b).div_euclid(2 * b)
 }
 
 impl Clip {
+    /// 타임라인에서 차지하는 길이(속도 반영).
     pub fn len(&self) -> Flicks {
-        self.src_out - self.src_in
+        self.to_timeline(self.src_out - self.src_in)
+    }
+
+    /// 타임라인 길이를 원본 길이로.
+    pub fn to_source(&self, d: Flicks) -> Flicks {
+        round_div(d * self.speed_pct as i64, 100)
+    }
+
+    /// 원본 길이를 타임라인 길이로.
+    pub fn to_timeline(&self, d: Flicks) -> Flicks {
+        round_div(d * 100, self.speed_pct.max(1) as i64)
+    }
+
+    /// 타임라인 시각 `t`에 해당하는 원본 시각.
+    pub fn src_at(&self, t: Flicks) -> Flicks {
+        self.src_in + self.to_source(t - self.start)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -123,6 +172,19 @@ impl Project {
     /// 미디어를 추가하고, 스트림마다 새 트랙과 클립을 만들어 `at` 위치에 놓는다.
     /// 한 파일에서 나온 클립은 서로 연결된다. 스트림별 시작 시각 차이는 여기서 보정한다.
     pub fn add_media(&mut self, info: MediaInfo, labels: Option<&TracksMeta>, at: Flicks) -> u64 {
+        self.place_media(info, labels, at, false)
+    }
+
+    /// 미디어를 타임라인 끝에 이어 붙인다. 새 트랙을 만들지 않고 기존 트랙에 순서대로 놓는다
+    /// (영상은 첫 영상 트랙, N번째 오디오는 N번째 오디오 트랙). 모자라는 트랙만 새로 만든다.
+    pub fn append_media(&mut self, info: MediaInfo, labels: Option<&TracksMeta>) -> u64 {
+        let (end, fps) = (self.duration(), self.settings.fps);
+        let frame = floor_frame(end, fps);
+        let at = if frame_time(frame, fps) < end { frame_time(frame + 1, fps) } else { end };
+        self.place_media(info, labels, at, true)
+    }
+
+    fn place_media(&mut self, info: MediaInfo, labels: Option<&TracksMeta>, at: Flicks, reuse: bool) -> u64 {
         let media_id = self.media.iter().map(|m| m.id).max().unwrap_or(0) + 1;
         let link = Some(self.timeline.alloc());
         // 타임라인 기준점: 영상의 첫 프레임(영상이 없으면 가장 먼저 시작하는 오디오)
@@ -136,10 +198,11 @@ impl Project {
                 0 => "영상".to_string(),
                 n => format!("영상 {}", n + 1),
             };
-            let track = self.add_track(TrackKind::Video, name, false);
+            let existing = self.timeline.tracks.iter().find(|t| reuse && t.kind == TrackKind::Video).map(|t| t.id);
+            let track = existing.unwrap_or_else(|| self.add_track(TrackKind::Video, name, false));
             let (src_in, src_out) = (v.grid.start(), v.grid.end());
             let id = self.timeline.alloc();
-            self.timeline.clips.push(Clip { id, track, media: media_id, stream: 0, start: at, src_in, src_out, link });
+            self.timeline.clips.push(Clip { id, track, media: media_id, stream: 0, start: at, src_in, src_out, link, speed_pct: 100, crop: Crop::default() });
         }
 
         for a in &info.audio {
@@ -148,7 +211,9 @@ impl Project {
                 .map(|l| l.name.clone())
                 .or_else(|| a.title.clone())
                 .unwrap_or_else(|| default_name(a.audio_index + 1));
-            let track = self.add_track(TrackKind::Audio, name, label.is_some_and(|l| l.default_muted));
+            let audio_tracks = self.timeline.tracks.iter().filter(|t| reuse && t.kind == TrackKind::Audio);
+            let existing = audio_tracks.map(|t| t.id).nth(a.audio_index as usize);
+            let track = existing.unwrap_or_else(|| self.add_track(TrackKind::Audio, name, label.is_some_and(|l| l.default_muted)));
             // 영상보다 먼저 시작하는 부분은 잘라내고, 늦게 시작하면 그만큼 뒤에 놓는다
             let src_in = a.start.max(origin);
             let src_out = a.start + a.duration;
@@ -165,6 +230,8 @@ impl Project {
                 src_in,
                 src_out,
                 link,
+                speed_pct: 100,
+                crop: Crop::default(),
             });
         }
 
@@ -223,6 +290,11 @@ impl Project {
             let is_video = self.track(c.track).is_some_and(|tr| tr.kind == TrackKind::Video);
             if !is_video || t < c.start || t > c.end() {
                 continue;
+            }
+            if c.speed_pct != 100 {
+                // 속도를 바꾼 클립은 원본 프레임과 화면 프레임이 1:1이 아니라서 프로젝트 격자를 따른다
+                let fps = self.settings.fps;
+                return (c.start + frame_time(nearest_frame(t - c.start, fps), fps)).min(c.end());
             }
             if let Some(grid) = self.video_grid(c.media) {
                 let src = grid.snap(c.src_in + (t - c.start)).clamp(c.src_in, c.src_out);

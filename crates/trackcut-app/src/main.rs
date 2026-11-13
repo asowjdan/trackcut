@@ -12,10 +12,11 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-/// 실행 인자: `trackcut-app [미디어 또는 프로젝트] [--seek 시각] [--play] [--select 클립순번] [--pos x,y] [--shot 화면캡처.png]`
+/// 실행 인자: `trackcut-app [미디어 또는 프로젝트 ...] [--seek 시각] [--play] [--select 클립순번] [--pos x,y] [--shot 화면캡처.png]`
 #[derive(Default)]
 pub struct Options {
-    pub input: Option<PathBuf>,
+    /// 열 파일들. 첫 파일로 프로젝트를 시작하고 나머지는 타임라인 끝에 이어 붙인다
+    pub inputs: Vec<PathBuf>,
     /// 시작할 때 이동할 시각
     pub seek: Option<String>,
     /// 화면을 한 번 그린 뒤 이 경로에 PNG로 저장하고 끝낸다(화면 확인용)
@@ -42,7 +43,7 @@ fn parse_options() -> Options {
                 let mut xy = text.split(',').filter_map(|n| n.trim().parse().ok());
                 options.pos = xy.next().zip(xy.next()).map(|(x, y)| [x, y]);
             }
-            _ => options.input = Some(PathBuf::from(arg)),
+            _ => options.inputs.push(PathBuf::from(arg)),
         }
     }
     options

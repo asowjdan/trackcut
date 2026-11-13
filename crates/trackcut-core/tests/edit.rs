@@ -2,7 +2,7 @@ use trackcut_core::edit::Edge;
 use trackcut_core::history::History;
 use trackcut_core::labels::TracksMeta;
 use trackcut_core::media::{AudioStream, MediaInfo, VideoStream};
-use trackcut_core::project::{Project, TrackKind};
+use trackcut_core::project::{Crop, Project, TrackKind};
 use trackcut_core::time::{frame_time, to_samples, Flicks, FrameGrid, Rational};
 
 const FPS: Rational = Rational::new(60, 1);
@@ -240,4 +240,77 @@ fn save_roundtrips_and_never_overwrites_the_source() {
     p.save(&file).unwrap();
     assert_eq!(Project::load(&file).unwrap(), p);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn spans(p: &Project, track_number: usize) -> Vec<(Flicks, Flicks)> {
+    clips_on(p, track_number).iter().map(|c| (c.1, c.2)).collect()
+}
+
+#[test]
+fn speed_changes_length_and_ripples_later_clips() {
+    let mut p = Project::from_media(media(600, 1), None);
+    p.split_at(f(200), None).unwrap();
+    let first = clips_on(&p, 0)[0].0;
+    p.set_speed(first, 200).unwrap();
+    assert_eq!(spans(&p, 0), [(0, f(100)), (f(100), f(500))]);
+    assert_eq!(spans(&p, 1), [(0, f(100)), (f(100), f(500))], "연결된 오디오도 같은 속도가 된다");
+    // 빨라진 클립을 나누면 원본 위치는 두 배로 간다
+    let right = p.split_at(f(50), Some(first)).unwrap();
+    assert_eq!(p.clip(right[0]).unwrap().src_in, f(100));
+    assert_eq!(spans(&p, 0), [(0, f(50)), (f(50), f(100)), (f(100), f(500))]);
+    assert!(p.set_speed(first, 10).is_err());
+}
+
+#[test]
+fn slowed_clip_can_be_trimmed_back_to_its_full_source() {
+    let mut p = Project::from_media(media(100, 1), None);
+    let clip = clips_on(&p, 0)[0].0;
+    p.set_speed(clip, 50).unwrap();
+    assert_eq!(spans(&p, 0), [(0, f(200))]);
+    assert_eq!(p.trim(clip, Edge::End, f(120)).unwrap(), f(120));
+    assert_eq!(p.clip(clip).unwrap().src_out, f(60));
+    assert_eq!(p.trim(clip, Edge::End, f(999)).unwrap(), f(200), "원본 길이를 넘지 않는다");
+}
+
+#[test]
+fn crop_only_applies_to_video_clips_and_keeps_a_minimum_size() {
+    let mut p = Project::from_media(media(60, 1), None);
+    let (video, audio) = (clips_on(&p, 0)[0].0, clips_on(&p, 1)[0].0);
+    let crop = Crop { left: 100, top: 50, right: 100, bottom: 50 };
+    p.set_crop(video, crop).unwrap();
+    assert_eq!(p.clip(video).unwrap().crop, crop);
+    assert!(p.set_crop(audio, crop).is_err());
+    assert!(p.set_crop(video, Crop { left: 1000, right: 915, ..Crop::default() }).is_err());
+    // 나눈 조각도 같은 자르기를 이어받는다
+    let right = p.split_at(f(30), Some(video)).unwrap();
+    assert!(right.iter().any(|&id| p.clip(id).unwrap().crop == crop));
+}
+
+#[test]
+fn appended_file_goes_to_the_end_on_the_same_tracks() {
+    let mut p = Project::from_media(media(600, 2), None);
+    p.append_media(media(300, 1), None);
+    assert_eq!(p.timeline.tracks.len(), 3, "새 트랙을 만들지 않는다");
+    assert_eq!(spans(&p, 0), [(0, f(600)), (f(600), f(900))]);
+    assert_eq!(spans(&p, 1), [(0, f(600)), (f(600), f(900))]);
+    assert_eq!(spans(&p, 2), [(0, f(600))]);
+    assert_eq!(p.media.len(), 2);
+    // 오디오 트랙이 더 많은 파일을 붙이면 모자라는 트랙만 생긴다
+    p.append_media(media(60, 3), None);
+    assert_eq!(p.timeline.tracks.len(), 4);
+    assert_eq!(spans(&p, 3), [(f(900), f(960))]);
+}
+
+#[test]
+fn keyed_edits_merge_into_one_undo_step() {
+    let mut p = Project::from_media(media(600, 1), None);
+    let mut history = History::default();
+    let track = p.timeline.tracks[1].id;
+    for db in [-1.0, -2.0, -3.0] {
+        history.apply_keyed(&mut p, "볼륨", "volume", |p| p.set_volume(track, db).map(|_| ())).unwrap();
+    }
+    assert_eq!(p.timeline.tracks[1].volume_db, -3.0);
+    history.undo(&mut p);
+    assert_eq!(p.timeline.tracks[1].volume_db, 0.0);
+    assert!(!history.can_undo());
 }

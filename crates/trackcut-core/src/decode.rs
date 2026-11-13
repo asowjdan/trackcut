@@ -38,6 +38,8 @@ struct Config {
     file_start: Flicks,
     width: u32,
     height: u32,
+    /// 원본 해상도 그대로 디코딩하는지
+    native: bool,
 }
 
 pub struct Decoder {
@@ -57,7 +59,7 @@ impl Decoder {
         let height = video.height.min(max_height).max(2) & !1;
         let width = ((video.width as u64 * height as u64 / video.height as u64) as u32).max(2) & !1;
         let file_start = info.file_start();
-        let config = Config { path: PathBuf::from(&info.path), grid: video.grid.clone(), file_start, width, height };
+        let config = Config { path: PathBuf::from(&info.path), grid: video.grid.clone(), file_start, width, height, native: (width, height) == (video.width, video.height) };
         let (requests, request_rx) = channel();
         let (frame_tx, frames) = channel();
         std::thread::spawn(move || worker(config, request_rx, frame_tx, on_frame));
@@ -108,8 +110,12 @@ impl Stream {
             command.args(["-ss", &format!("{secs:.6}")]);
         }
         command.arg("-i").arg(&config.path);
-        let scale = format!("scale={}:{}:flags=bilinear", config.width, config.height);
-        command.args(["-map", "0:v:0", "-an", "-sn", "-vf", &scale]);
+        command.args(["-map", "0:v:0", "-an", "-sn"]);
+        // 원본 크기 그대로면 크기 조절을 건너뛰어 화질 손실이 없다
+        if !config.native {
+            let scale = format!("scale={}:{}:flags=bicubic", config.width, config.height);
+            command.args(["-vf", &scale]);
+        }
         // passthrough: 디코딩된 프레임을 복제하거나 버리지 않고 하나씩 그대로 내보낸다
         command.args(["-pix_fmt", "rgb24", "-fps_mode", "passthrough", "-f", "rawvideo", "-"]);
         command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());

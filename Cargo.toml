@@ -10,3 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# 개발용 빌드에서도 외부 라이브러리(화면 그리기 등)는 최적화해서 미리보기가 끊기지 않게 한다
+[profile.dev.package."*"]
+opt-level = 2

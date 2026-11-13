@@ -1,5 +1,5 @@
 //! 타임라인 그리기와 조작: 휠 확대·축소, 스크롤, 재생 위치 이동,
-//! 클립·트랙 선택, 클립을 끌어 이동·트림, 트랙 이름 바꾸기.
+//! 클립·트랙 선택, 클립을 끌어 이동·트림, 두 번 눌러 구간 지정, 트랙 이름 바꾸기.
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CursorIcon, FontId, Key, Pos2, Rect, Sense, Stroke};
 use trackcut_core::edit::Edge;
@@ -17,6 +17,10 @@ const MIN_PX_PER_SEC: f32 = 0.2;
 const MAX_PX_PER_SEC: f32 = 2400.0;
 /// 클립 양 끝에서 이 폭 안쪽을 잡으면 트림이 된다
 const EDGE_WIDTH: f32 = 6.0;
+/// 시작점·끝점 선에서 이 거리 안쪽을 잡으면 선을 끈다
+const MARK_REACH: f32 = 5.0;
+/// 두 번 눌러 구간을 만들 때, 누른 곳 양쪽으로 잡는 폭
+const MARK_SPREAD: f32 = 60.0;
 
 pub struct View {
     pub px_per_sec: f32,
@@ -26,6 +30,8 @@ pub struct View {
     pub fit: bool,
     /// 클립을 끄는 중이면, 잡은 방식과 "잡은 지점 − 클립 기준점(시작 또는 끝)"
     grabbed: Option<(Grab, Flicks)>,
+    /// 시작점(false)이나 끝점(true) 선을 끄는 중
+    mark_grabbed: Option<bool>,
     /// 눈금이나 빈 곳을 끌어 재생 위치를 옮기는 중
     scrubbing: bool,
     /// 이름을 고치고 있는 트랙: (트랙, 입력 중인 글, 입력 칸에 포커스를 줬는지)
@@ -34,7 +40,7 @@ pub struct View {
 
 impl Default for View {
     fn default() -> Self {
-        View { px_per_sec: 50.0, scroll: 0.0, fit: true, grabbed: None, scrubbing: false, rename: None }
+        View { px_per_sec: 50.0, scroll: 0.0, fit: true, grabbed: None, mark_grabbed: None, scrubbing: false, rename: None }
     }
 }
 
@@ -57,6 +63,10 @@ pub enum Action {
     DragTo(Flicks),
     DragEnd,
     Rename(u64, String),
+    /// 시작점과 끝점을 한꺼번에 지정
+    SetMarks(Flicks, Flicks),
+    /// 시작점(false)이나 끝점(true)을 옮긴다
+    MoveMark(bool, Flicks),
 }
 
 /// 화면에 그려진 클립 하나의 위치.
@@ -126,6 +136,9 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     for mark in [marks.range.0, marks.range.1].into_iter().flatten() {
         let x = x_of(mark);
         lanes.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(1.5_f32,Color32::from_rgb(255, 200, 60)));
+        // 눈금 위의 손잡이: 여기나 선을 끌어 구간을 조절한다
+        let handle = Rect::from_center_size(pos2(x, lane.top() + RULER_HEIGHT - 6.0), vec2(9.0, 12.0));
+        lanes.rect_filled(handle, 2.0, Color32::from_rgb(255, 200, 60));
     }
 
     // 선택한 클립과 연결된 클립들은 옅은 테두리로 함께 표시한다
@@ -153,9 +166,10 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
             let body = Rect::from_min_max(pos2(left, top + 3.0), pos2(right.max(left + 1.0), top + ROW_HEIGHT - 3.0));
             lanes.rect_filled(body, 3.0, color);
             if let Some((peaks, stream_start)) = waves.get(&(clip.media, clip.stream)).filter(|_| track.kind == TrackKind::Audio) {
-                // 화면 왼쪽 끝 시각에서 클립 안의 원본 위치까지의 차이(초)
-                let source_at_scroll = flicks_to_secs(clip.src_in - stream_start - clip.start) + view.scroll;
-                draw_wave(&lanes, body.intersect(lane), lane.left(), view.px_per_sec, source_at_scroll, peaks);
+                // 화면 왼쪽 끝 시각에 해당하는 원본 위치(초). 속도를 바꾼 클립은 원본이 그만큼 빨리 지나간다
+                let speed = clip.speed_pct as f64 / 100.0;
+                let source_at_scroll = flicks_to_secs(clip.src_in - stream_start) + (view.scroll - flicks_to_secs(clip.start)) * speed;
+                draw_wave(&lanes, body.intersect(lane), lane.left(), (view.px_per_sec as f64 / speed) as f32, source_at_scroll, peaks);
             }
             let outline = if marks.clip == Some(clip.id) {
                 Stroke::new(2.0_f32, Color32::WHITE)
@@ -192,7 +206,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     let x = x_of(marks.playhead);
     lanes.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(2.0_f32,Color32::from_rgb(235, 70, 70)));
 
-    let mut actions = interact(ui, &response, project, view, lane, &hits, &headers);
+    let mut actions = interact(ui, &response, project, view, marks, lane, &hits, &headers);
     rename_box(ui, view, &headers, &mut actions);
     actions
 }
@@ -203,6 +217,7 @@ fn interact(
     response: &egui::Response,
     project: &Project,
     view: &mut View,
+    marks: &Marks,
     lane: Rect,
     hits: &[Hit],
     headers: &[(u64, Rect)],
@@ -213,9 +228,25 @@ fn interact(
     let seek_at = |x: f32| time_at(x).clamp(0, project.duration());
     let clip_at = |p: Pos2| hits.iter().find(|h| lane.contains(p) && h.body.contains(p));
 
+    // 가까이 있는 시작점·끝점 선(끝점이면 true)
+    let mark_at = |p: Pos2| {
+        let near = |mark: Option<Flicks>| {
+            let x = lane.left() + ((flicks_to_secs(mark?) - scroll) * px_per_sec as f64) as f32;
+            Some((p.x - x).abs()).filter(|d| lane.contains(p) && *d <= MARK_REACH)
+        };
+        match (near(marks.range.0), near(marks.range.1)) {
+            (Some(a), Some(b)) => Some(b < a),
+            (Some(_), None) => Some(false),
+            (None, Some(_)) => Some(true),
+            (None, None) => None,
+        }
+    };
+
     if response.drag_started() {
         if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
-            if let Some(hit) = clip_at(origin) {
+            if let Some(which) = mark_at(origin) {
+                view.mark_grabbed = Some(which);
+            } else if let Some(hit) = clip_at(origin) {
                 let grab = hit.grab(origin);
                 let anchor = if grab == Grab::Trim(Edge::End) { hit.end } else { hit.start };
                 view.grabbed = Some((grab, time_at(origin.x) - anchor));
@@ -227,7 +258,9 @@ fn interact(
         }
     }
     if let Some(p) = response.interact_pointer_pos().filter(|_| response.dragged()) {
-        if let Some((_, offset)) = view.grabbed {
+        if let Some(which) = view.mark_grabbed {
+            actions.push(Action::MoveMark(which, seek_at(p.x)));
+        } else if let Some((_, offset)) = view.grabbed {
             actions.push(Action::DragTo(time_at(p.x) - offset));
         } else if view.scrubbing {
             actions.push(Action::Seek(seek_at(p.x)));
@@ -238,6 +271,7 @@ fn interact(
             actions.push(Action::DragEnd);
         }
         view.scrubbing = false;
+        view.mark_grabbed = None;
     }
     if let Some(p) = response.interact_pointer_pos().filter(|_| response.clicked()) {
         if let Some(&(track, _)) = headers.iter().find(|(_, r)| r.contains(p)) {
@@ -256,8 +290,17 @@ fn interact(
         }
     }
 
+    // 타임라인을 두 번 누르면 그 자리 양쪽에 시작점과 끝점을 놓는다
+    if let Some(p) = response.interact_pointer_pos().filter(|p| response.double_clicked() && p.x >= lane.left()) {
+        actions.push(Action::SetMarks(seek_at(p.x - MARK_SPREAD), seek_at(p.x + MARK_SPREAD)));
+    }
+
     // 커서 모양으로 잡을 수 있는 곳을 알려 준다
     let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.hovered());
+    if view.mark_grabbed.is_some() || (view.grabbed.is_none() && hover.and_then(mark_at).is_some()) {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        return actions;
+    }
     let grab = view.grabbed.map(|(grab, _)| grab).or_else(|| hover.and_then(|p| clip_at(p).map(|h| h.grab(p))));
     match grab {
         Some(Grab::Trim(_)) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),

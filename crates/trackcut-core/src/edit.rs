@@ -1,4 +1,4 @@
-//! 편집 동작: 분할, 구간 삭제, 트림, 이동, 연결/해제, 트랙 소리 설정.
+//! 편집 동작: 분할, 구간 삭제, 트림, 이동, 연결/해제, 재생 속도, 화면 자르기, 트랙 소리 설정.
 //!
 //! 시각은 호출하는 쪽에서 `Project::snap`으로 프레임 경계에 붙여 넘긴다.
 //! 연결된 클립(같은 `link`)은 함께 잘리고 움직인다.
@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use crate::error::{edit_err, Result};
-use crate::project::{Clip, Project, Track, VOLUME_MAX_DB, VOLUME_MIN_DB};
-use crate::time::Flicks;
+use crate::project::{Clip, Crop, Project, Track, TrackKind, SPEED_MAX_PCT, SPEED_MIN_PCT, VOLUME_MAX_DB, VOLUME_MIN_DB};
+use crate::time::{floor_frame, frame_time, Flicks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
@@ -47,13 +47,13 @@ impl Project {
     fn cut_right(&mut self, i: usize, cut: Flicks, resume: Flicks, place: Flicks, links: &mut HashMap<u64, u64>) -> u64 {
         let mut right = self.timeline.clips[i].clone();
         right.id = self.timeline.alloc();
-        right.src_in += resume - right.start;
+        right.src_in = right.src_at(resume);
         right.start = place;
         if let Some(old) = right.link {
             right.link = Some(*links.entry(old).or_insert_with(|| self.timeline.alloc()));
         }
         let left = &mut self.timeline.clips[i];
-        left.src_out = left.src_in + (cut - left.start);
+        left.src_out = left.src_at(cut);
         let id = right.id;
         self.timeline.clips.push(right);
         id
@@ -111,10 +111,11 @@ impl Project {
                 touched.push(right);
             } else if start >= a {
                 let clip = &mut self.timeline.clips[i];
-                clip.src_in += b - start;
+                clip.src_in = clip.src_at(b);
                 clip.start = place;
             } else {
-                self.timeline.clips[i].src_out -= end - a;
+                let clip = &mut self.timeline.clips[i];
+                clip.src_out = clip.src_at(a);
             }
         }
         self.timeline.clips.retain(|c| !removed.contains(&c.id));
@@ -155,12 +156,12 @@ impl Project {
             match edge {
                 Edge::Start => {
                     let prev_end = same_track().filter(|o| o.end() <= c.start).map(Clip::end).max().unwrap_or(0);
-                    lo = lo.max(c.start - (c.src_in - src_lo)).max(prev_end);
+                    lo = lo.max(c.start - c.to_timeline(c.src_in - src_lo)).max(prev_end);
                     hi = hi.min(c.end() - 1);
                 }
                 Edge::End => {
                     let next_start = same_track().filter(|o| o.start >= c.end()).map(|o| o.start).min().unwrap_or(Flicks::MAX);
-                    hi = hi.min(c.end() + (src_hi - c.src_out)).min(next_start);
+                    hi = hi.min(c.end() + c.to_timeline(src_hi - c.src_out)).min(next_start);
                     lo = lo.max(c.start + 1);
                 }
             }
@@ -173,10 +174,10 @@ impl Project {
             let c = &mut self.timeline.clips[i];
             match edge {
                 Edge::Start => {
-                    c.src_in += t - c.start;
+                    c.src_in = c.src_at(t);
                     c.start = t;
                 }
-                Edge::End => c.src_out = c.src_in + (t - c.start),
+                Edge::End => c.src_out = c.src_at(t),
             }
         }
         Ok(t)
@@ -214,6 +215,54 @@ impl Project {
         for i in indices {
             self.timeline.clips[i].link = link;
         }
+        Ok(())
+    }
+
+    /// 재생 속도(%)를 바꾼다. 연결된 클립도 같은 속도가 되고, 뒤쪽 클립은 달라진 길이만큼 밀리거나
+    /// 당겨진다. 새 길이는 프레임 경계에 맞춘다(끝의 1프레임 미만은 잘린다).
+    /// 소리는 속도와 함께 음높이도 바뀐다.
+    pub fn set_speed(&mut self, id: u64, pct: u32) -> Result<()> {
+        if !(SPEED_MIN_PCT..=SPEED_MAX_PCT).contains(&pct) {
+            return edit_err(format!("속도는 {SPEED_MIN_PCT}% ~ {SPEED_MAX_PCT}% 사이여야 한다"));
+        }
+        let anchor = self.clip(id)?.clone();
+        if anchor.speed_pct == pct {
+            return Ok(());
+        }
+        let group = self.group(id)?;
+        let fps = self.settings.fps;
+        let old_end = anchor.end();
+        let exact = Clip { speed_pct: pct, ..anchor.clone() }.len();
+        let new_end = anchor.start + frame_time(floor_frame(exact, fps).max(1), fps);
+        for c in self.timeline.clips.iter_mut() {
+            if group.contains(&c.id) {
+                let follows = c.id == id || c.end() == old_end;
+                c.speed_pct = pct;
+                if follows {
+                    c.src_out = c.src_at(new_end).min(c.src_out);
+                }
+            } else if c.start >= old_end {
+                c.start += new_end - old_end;
+            }
+        }
+        Ok(())
+    }
+
+    /// 영상 클립의 화면을 자른다. 잘린 화면은 비율을 지킨 채 프로젝트 화면에 맞춰 키운다.
+    pub fn set_crop(&mut self, id: u64, crop: Crop) -> Result<()> {
+        let clip = self.clip(id)?;
+        if self.track(clip.track).is_none_or(|t| t.kind != TrackKind::Video) {
+            return edit_err("영상 클립만 화면을 자를 수 있다");
+        }
+        let video = self.media_info(clip.media).and_then(|m| m.video.as_ref());
+        let Some((width, height)) = video.map(|v| (v.width, v.height)) else {
+            return edit_err("영상 스트림이 없다");
+        };
+        if crop.left as u64 + crop.right as u64 + 16 > width as u64 || crop.top as u64 + crop.bottom as u64 + 16 > height as u64 {
+            return edit_err("자르고 남는 화면이 너무 작다");
+        }
+        let i = self.clip_index(id)?;
+        self.timeline.clips[i].crop = crop;
         Ok(())
     }
 

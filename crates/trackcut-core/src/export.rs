@@ -120,9 +120,12 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
             let offset = info.file_start() + half;
             let label = format!("[v{}]", labels.len());
             graph.filters.push(format!(
-                "[{input}:v:0]trim=start={}:end={},setpts=PTS-STARTPTS,scale={width}:{height},fps={rate},setsar=1,format=yuv420p{label}",
+                "[{input}:v:0]trim=start={}:end={},setpts=(PTS-STARTPTS)*100/{}{},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={rate},setsar=1,format=yuv420p,trim=duration={}{label}",
                 secs(clip.src_in - offset),
                 secs(clip.src_out - offset),
+                clip.speed_pct,
+                crop_filter(clip, video.width, video.height),
+                secs(clip.len()),
             ));
             labels.push(label);
             cursor = clip.end();
@@ -155,6 +158,11 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
                 secs(clip.src_in - offset),
                 secs(clip.src_out - offset),
             );
+            // 속도를 바꾼 소리는 음높이도 함께 바뀐다(미리듣기와 같다)
+            if clip.speed_pct != 100 {
+                let rate = SAMPLE_RATE as u64 * clip.speed_pct as u64 / 100;
+                chain += &format!(",asetrate={rate},aresample={SAMPLE_RATE},atrim=duration={}", secs(clip.len()));
+            }
             // 잘린 경계에서 "딱" 소리가 나지 않게 짧은 페이드를 넣는다
             let (source_start, source_end) = project.source_bounds(clip);
             if fade > 0 && clip.len() > fade * 2 {
@@ -195,6 +203,17 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
         return edit_err("내보낼 영상이나 소리가 없다");
     }
     Ok(graph)
+}
+
+/// 화면 자르기 필터(자르지 않으면 빈 문자열).
+fn crop_filter(clip: &Clip, width: u32, height: u32) -> String {
+    let c = clip.crop;
+    if c.is_none() {
+        return String::new();
+    }
+    let w = width.saturating_sub(c.left + c.right).max(2);
+    let h = height.saturating_sub(c.top + c.bottom).max(2);
+    format!(",crop={w}:{h}:{}:{}", c.left, c.top)
 }
 
 fn safe_file_name(name: &str) -> String {

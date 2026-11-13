@@ -103,6 +103,7 @@ impl Sound {
                         start: to_samples(clip.start, SAMPLE_RATE),
                         offset: to_samples(clip.src_in - stream.start, SAMPLE_RATE),
                         len: to_samples(clip.len(), SAMPLE_RATE),
+                        speed: clip.speed_pct as f64 / 100.0,
                     })
                 });
                 PlanTrack { gain, clips: clips.collect() }

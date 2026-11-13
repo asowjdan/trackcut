@@ -1,6 +1,8 @@
 //! 편집 화면의 상태와 화면 구성.
 
-use std::collections::HashMap;
+mod inspector;
+
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
@@ -9,9 +11,9 @@ use eframe::egui::{self, pos2, Color32, Key, Rect, RichText};
 use trackcut_core::decode::Decoder;
 use trackcut_core::history::History;
 use trackcut_core::labels::TracksMeta;
-use trackcut_core::media::VideoStream;
+use trackcut_core::media::{MediaInfo, VideoStream};
 use trackcut_core::probe::probe;
-use trackcut_core::project::{Clip, Project, TrackKind, VOLUME_MAX_DB, VOLUME_MIN_DB};
+use trackcut_core::project::{Clip, Crop, Project, TrackKind, VOLUME_MAX_DB, VOLUME_MIN_DB};
 use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, timecode, Flicks, FLICKS_PER_SEC};
 
 use crate::drag::Drag;
@@ -20,10 +22,11 @@ use crate::sound::Sound;
 use crate::timeline::{self, Action, Marks, View};
 use crate::Options;
 
-/// 미리보기는 이 높이 이하로 줄여서 디코딩한다.
-const PREVIEW_HEIGHT: u32 = 540;
+/// 미리보기 화질 선택지: (디코딩할 최대 높이, 이름). 원본은 줄이지 않는다.
+const PREVIEW_CHOICES: [(u32, &str); 3] = [(u32::MAX, "원본"), (720, "720p"), (540, "540p (빠름)")];
 
 type Loaded = Result<(Project, PathBuf), String>;
+type Added = Result<(MediaInfo, Option<TracksMeta>), String>;
 
 /// 미디어나 프로젝트 파일을 연다. 미디어 옆에 프로젝트 파일이 이미 있으면 그것을 이어서 연다.
 fn load(path: PathBuf) -> Loaded {
@@ -57,6 +60,10 @@ pub struct TrackcutApp {
     project_path: PathBuf,
     history: History,
     loading: Option<Receiver<Loaded>>,
+    /// 타임라인 끝에 이어 붙이려고 분석 중인 파일
+    adding: Option<Receiver<Added>>,
+    /// 열거나 이어 붙일 차례를 기다리는 파일
+    queue: VecDeque<PathBuf>,
     playhead: Flicks,
     playing: bool,
     last_tick: Instant,
@@ -72,6 +79,11 @@ pub struct TrackcutApp {
     /// 지금 보여야 하는 (미디어, 프레임)과 실제로 화면에 올라온 것
     wanted: Option<(u64, u64)>,
     shown: Option<(u64, u64)>,
+    /// 미리보기를 디코딩할 최대 높이
+    preview_height: u32,
+    /// 지금 보이는 클립의 화면 자르기와 원본 해상도
+    view_crop: Option<(Crop, u32, u32)>,
+    tab: inspector::Tab,
     status: String,
     sound: Sound,
     /// 소리 엔진에 재생을 지시해 둔 상태인지
@@ -88,6 +100,8 @@ impl TrackcutApp {
             project_path: PathBuf::new(),
             history: History::default(),
             loading: None,
+            adding: None,
+            queue: VecDeque::new(),
             playhead: 0,
             playing: false,
             last_tick: Instant::now(),
@@ -101,6 +115,9 @@ impl TrackcutApp {
             texture: None,
             wanted: None,
             shown: None,
+            preview_height: PREVIEW_CHOICES[0].0,
+            view_crop: None,
+            tab: inspector::Tab::default(),
             status: String::new(),
             sound: Sound::new(),
             sound_playing: false,
@@ -109,9 +126,8 @@ impl TrackcutApp {
             shot_sent: false,
             options,
         };
-        if let Some(path) = app.options.input.clone() {
-            app.open(&ctx, path);
-        }
+        app.queue.extend(std::mem::take(&mut app.options.inputs));
+        app.next_file(&ctx);
         app
     }
 
@@ -125,6 +141,45 @@ impl TrackcutApp {
         });
         self.loading = Some(rx);
         self.status = "파일 분석 중…".into();
+    }
+
+    /// 기다리는 파일을 하나 꺼낸다. 열린 프로젝트가 없으면 그 파일로 시작하고, 있으면 끝에 이어 붙인다.
+    fn next_file(&mut self, ctx: &egui::Context) {
+        if self.loading.is_some() || self.adding.is_some() {
+            return;
+        }
+        let Some(path) = self.queue.pop_front() else { return };
+        let is_project = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        if self.project.is_none() || is_project {
+            self.open(ctx, path);
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe(&path).map(|info| (info, TracksMeta::load_for(&path))).map_err(|e| e.to_string()));
+            ctx.request_repaint();
+        });
+        self.adding = Some(rx);
+        self.status = "추가할 파일 분석 중…".into();
+    }
+
+    fn finish_adding(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.adding.as_ref().and_then(|rx| rx.try_recv().ok()) else { return };
+        self.adding = None;
+        match result {
+            Ok((info, labels)) => {
+                let added = self.edit("파일 추가", |p| {
+                    p.append_media(info, labels.as_ref());
+                    Ok(())
+                });
+                if let (Some(()), Some(project)) = (added, &self.project) {
+                    self.sound.load(project, ctx);
+                    self.view.fit = true;
+                }
+            }
+            Err(e) => self.status = format!("추가할 수 없음: {e}"),
+        }
     }
 
     fn finish_loading(&mut self, ctx: &egui::Context) {
@@ -170,13 +225,14 @@ impl TrackcutApp {
         // 뒤로 갈 때는 바로 앞 프레임이 속한 클립을 기준으로 한다(클립 경계에서 멈추지 않게)
         let probe_at = if n < 0 { (t - 1).max(0) } else { t };
         let next = match video_at(project, probe_at) {
-            Some((clip, video)) => {
+            Some((clip, video)) if clip.speed_pct == 100 => {
                 let base = video.grid.frame_at(clip.src_in + (probe_at - clip.start)) as i64;
                 let frame = if n < 0 { base + n + 1 } else { base + n };
                 let src = video.grid.time_of(frame.max(0) as u64).clamp(clip.src_in, clip.src_out);
                 clip.start + (src - clip.src_in)
             }
-            None => {
+            // 영상이 없거나 속도를 바꾼 클립은 프로젝트 프레임 단위로 움직인다
+            _ => {
                 let fps = project.settings.fps;
                 frame_time(floor_frame(t, fps) + n, fps)
             }
@@ -212,6 +268,21 @@ impl TrackcutApp {
                 None
             }
         }
+    }
+
+    /// `edit`과 같지만 같은 `key`로 연달아 고친 값은 Undo 한 단계로 묶는다(숫자 칸, 슬라이더).
+    fn edit_keyed(&mut self, label: &str, key: &str, f: impl FnOnce(&mut Project) -> trackcut_core::Result<()>) {
+        let Some(project) = self.project.as_mut() else { return };
+        self.status = match self.history.apply_keyed(project, label, key, f) {
+            Ok(()) => label.to_string(),
+            Err(e) => e.to_string(),
+        };
+    }
+
+    fn set_preview_height(&mut self, height: u32) {
+        self.preview_height = height;
+        self.decoders.clear();
+        (self.wanted, self.shown) = (None, None);
     }
 
     fn split(&mut self) {
@@ -284,6 +355,16 @@ impl TrackcutApp {
                         Err(e) => self.status = e.to_string(),
                     }
                     self.seek(self.playhead);
+                }
+            }
+            Action::SetMarks(a, b) => (self.mark_in, self.mark_out) = (Some(project.snap(a)), Some(project.snap(b))),
+            Action::MoveMark(is_out, t) => {
+                // 두 선이 서로를 넘어가지 않게 한다
+                let t = project.snap(t);
+                if is_out {
+                    self.mark_out = Some(t.max(self.mark_in.unwrap_or(0)));
+                } else {
+                    self.mark_in = Some(t.min(self.mark_out.unwrap_or(Flicks::MAX)));
                 }
             }
             Action::Rename(track, name) => {
@@ -362,9 +443,9 @@ impl TrackcutApp {
     fn update_preview(&mut self, ctx: &egui::Context) {
         let Some(project) = &self.project else { return };
         let lookup = if self.playhead >= project.duration() { self.playhead - 1 } else { self.playhead };
-        let target = video_at(project, lookup).map(|(clip, video)| {
-            (clip.media, video.grid.frame_at(clip.src_in + (lookup - clip.start)))
-        });
+        let at = video_at(project, lookup);
+        self.view_crop = at.map(|(clip, video)| (clip.crop, video.width, video.height));
+        let target = at.map(|(clip, video)| (clip.media, video.grid.frame_at(clip.src_at(lookup))));
         if target != self.wanted {
             self.wanted = target;
             if let Some((media, frame)) = target {
@@ -372,7 +453,7 @@ impl TrackcutApp {
                     let repaint = ctx.clone();
                     let decoder = project
                         .media_info(media)
-                        .and_then(|info| Decoder::new(info, PREVIEW_HEIGHT, move || repaint.request_repaint()));
+                        .and_then(|info| Decoder::new(info, self.preview_height, move || repaint.request_repaint()));
                     if let Some(decoder) = decoder {
                         self.decoders.insert(media, decoder);
                     }
@@ -476,8 +557,11 @@ impl TrackcutApp {
             match action {
                 MixerAction::Mute(id, on) => self.edit("음소거", |p| p.set_muted(id, on)),
                 MixerAction::Solo(id, on) => self.edit("솔로", |p| p.set_solo(id, on)),
-                // 슬라이더를 끄는 동안 Undo 단계가 쌓이지 않게 볼륨은 바로 적용한다
-                MixerAction::Volume(id, db) => self.project.as_mut().and_then(|p| p.set_volume(id, db).ok()).map(|_| ()),
+                // 슬라이더를 끄는 동안의 값들은 Undo 한 단계로 묶는다
+                MixerAction::Volume(id, db) => {
+                    self.edit_keyed("볼륨", &format!("volume:{id}"), |p| p.set_volume(id, db).map(|_| ()));
+                    None
+                }
             };
         }
     }
@@ -485,16 +569,25 @@ impl TrackcutApp {
     fn preview(&mut self, ui: &mut egui::Ui) {
         let area = ui.available_rect_before_wrap();
         match (&self.project, &self.texture) {
-            (Some(_), Some(texture)) if self.wanted.is_some() => {
+            (Some(project), Some(texture)) if self.wanted.is_some() => {
                 let size = texture.size_vec2();
-                let scale = (area.width() / size.x).min(area.height() / size.y);
-                let rect = Rect::from_center_size(area.center(), size * scale);
-                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                let (crop, width, height) = self.view_crop.unwrap_or((Crop::default(), size.x as u32, size.y as u32));
+                let (width, height) = (width.max(1) as f32, height.max(1) as f32);
+                // 자른 화면만 텍스처에서 골라, 내보낼 때처럼 비율을 지켜 프로젝트 화면 안에 맞춘다
+                let uv = Rect::from_min_max(
+                    pos2(crop.left as f32 / width, crop.top as f32 / height),
+                    pos2(1.0 - crop.right as f32 / width, 1.0 - crop.bottom as f32 / height),
+                );
+                let fit = |inner: egui::Vec2, outer: Rect| {
+                    Rect::from_center_size(outer.center(), inner * (outer.width() / inner.x).min(outer.height() / inner.y))
+                };
+                let frame = fit(egui::vec2(project.settings.width.max(1) as f32, project.settings.height.max(1) as f32), area);
+                let rect = fit(egui::vec2(width * uv.width(), height * uv.height()), frame);
                 ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
             }
             (Some(_), _) => {}
             (None, _) => {
-                let text = if self.loading.is_some() { "파일 분석 중…" } else { "영상 파일을 이 창에 끌어다 놓으세요" };
+                let text = if self.loading.is_some() { "파일 분석 중…" } else { "영상 파일을 이 창에 끌어다 놓으세요 (여러 개를 놓으면 차례로 이어 붙는다)" };
                 ui.centered_and_justified(|ui| ui.label(RichText::new(text).size(18.0).color(Color32::GRAY)));
             }
         }
@@ -506,7 +599,7 @@ impl TrackcutApp {
         ctx.request_repaint();
         self.frames_drawn += 1;
         let played = !self.options.play || self.playhead >= 2 * FLICKS_PER_SEC;
-        let ready = self.loading.is_none() && self.sound.pending == 0 && played && (self.wanted.is_none() || self.shown == self.wanted || self.playing);
+        let ready = self.loading.is_none() && self.adding.is_none() && self.queue.is_empty() && self.sound.pending == 0 && played && (self.wanted.is_none() || self.shown == self.wanted || self.playing);
         if !self.shot_sent && ((ready && self.frames_drawn > 10) || self.frames_drawn > 1800) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             self.shot_sent = true;
@@ -530,10 +623,10 @@ impl TrackcutApp {
 impl eframe::App for TrackcutApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.finish_loading(ctx);
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.open(ctx, path);
-        }
+        self.finish_adding(ctx);
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        self.queue.extend(dropped);
+        self.next_file(ctx);
         self.handle_keys(ctx);
 
         let now = Instant::now();
@@ -564,6 +657,9 @@ impl eframe::App for TrackcutApp {
         self.update_preview(ctx);
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
+        egui::SidePanel::left("inspector").default_width(250.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
+        });
         egui::TopBottomPanel::bottom("timeline").resizable(true).default_height(300.0).show(ctx, |ui| {
             let Some(project) = &self.project else { return };
             let marks = Marks {
