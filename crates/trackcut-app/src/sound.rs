@@ -97,7 +97,7 @@ impl Sound {
         audio_tracks
             .map(|track| {
                 let gain = if project.is_audible(track.id) { 10f32.powf(track.volume_db / 20.0) } else { 0.0 };
-                let clips = project.timeline.clips.iter().filter(|c| c.track == track.id).filter_map(|clip| {
+                let clips = project.timeline.clips.iter().filter(|c| c.track == track.id && !c.muted).filter_map(|clip| {
                     let audio = self.tracks.get(&(clip.media, clip.stream))?;
                     let stream = project.media_info(clip.media)?.audio.iter().find(|a| a.audio_index == clip.stream)?;
                     Some(PlanClip {

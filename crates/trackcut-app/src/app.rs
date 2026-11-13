@@ -487,7 +487,13 @@ impl TrackcutApp {
         }
     }
 
+    /// 그 트랙에서 고른 클립이 있으면 그 클립만, 없으면 트랙 전체의 소리를 켜고 끈다.
     fn toggle_track_mute(&mut self, track: u64) {
+        let chosen = self.project.as_ref().zip(self.selected_clip).and_then(|(p, id)| p.clip(id).ok()).filter(|c| c.track == track);
+        if let Some((id, muted)) = chosen.map(|c| (c.id, c.muted)) {
+            self.edit(if muted { "클립 소리 켜기" } else { "클립 소리 끄기" }, |p| p.set_clip_muted(id, !muted));
+            return;
+        }
         let Some(muted) = self.project.as_ref().and_then(|p| p.track(track)).map(|t| t.muted) else { return };
         self.edit(if muted { "음소거 해제" } else { "음소거" }, |p| p.set_muted(track, !muted));
     }

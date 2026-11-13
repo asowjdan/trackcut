@@ -74,6 +74,9 @@ pub struct Clip {
     /// 화면 자르기(영상 클립만 쓴다)
     #[serde(default, skip_serializing_if = "Crop::is_none")]
     pub crop: Crop,
+    /// 이 클립만 소리를 끈다(트랙 전체 음소거와 별개)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub muted: bool,
 }
 
 pub const SPEED_MIN_PCT: u32 = 25;
@@ -212,7 +215,7 @@ impl Project {
             let track = existing.unwrap_or_else(|| self.add_track(TrackKind::Video, name, false));
             let (src_in, src_out) = (v.grid.start(), v.grid.end());
             let id = self.timeline.alloc();
-            self.timeline.clips.push(Clip { id, track, media: media_id, stream: 0, start: at, src_in, src_out, link, speed_pct: 100, crop: Crop::default() });
+            self.timeline.clips.push(Clip { id, track, media: media_id, stream: 0, start: at, src_in, src_out, link, speed_pct: 100, crop: Crop::default(), muted: false });
         }
 
         for a in &info.audio {
@@ -242,6 +245,7 @@ impl Project {
                 link,
                 speed_pct: 100,
                 crop: Crop::default(),
+                muted: false,
             });
         }
 

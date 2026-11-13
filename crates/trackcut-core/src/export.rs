@@ -150,7 +150,7 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
         }
         let number = graph.tracks.len();
         let mut pieces = Vec::new();
-        for clip in sorted_clips(project, track.id) {
+        for clip in sorted_clips(project, track.id).into_iter().filter(|c| !c.muted) {
             let info = project.media_info(clip.media).ok_or_else(|| Error::Edit("미디어 정보가 없다".into()))?;
             let input = input_of(clip.media, &mut graph.inputs);
             let offset = info.file_start();

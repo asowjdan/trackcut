@@ -467,6 +467,13 @@ impl Project {
         Ok(db)
     }
 
+    /// 클립 하나만 소리를 끄거나 켠다. 같은 트랙의 다른 클립은 그대로다.
+    pub fn set_clip_muted(&mut self, id: u64, muted: bool) -> Result<()> {
+        let i = self.clip_index(id)?;
+        self.timeline.clips[i].muted = muted;
+        Ok(())
+    }
+
     pub fn set_muted(&mut self, track: u64, muted: bool) -> Result<()> {
         self.track_mut(track)?.muted = muted;
         Ok(())

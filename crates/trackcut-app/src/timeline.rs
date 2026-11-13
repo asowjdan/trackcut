@@ -22,8 +22,6 @@ const ROW_HEIGHT: f32 = 46.0;
 const ROW_MIN_HEIGHT: f32 = 30.0;
 /// "원본", "편집본" 묶음 이름 띠의 높이
 const GROUP_HEIGHT: f32 = 18.0;
-/// 클립 위쪽의 제목 띠 높이
-const TITLE_HEIGHT: f32 = 14.0;
 const MIN_PX_PER_SEC: f32 = 0.2;
 /// 가장 크게 확대하면 60fps 기준 1프레임이 40px
 const MAX_PX_PER_SEC: f32 = 2400.0;
@@ -278,32 +276,35 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
             }
             let body = Rect::from_min_max(pos2(left, top + 3.0), pos2(right.max(left + 1.0), top + row_h - 3.0));
             let selected = marks.clip == Some(clip.id);
-            lanes.rect_filled(body, 3.0, color);
-            let content = Rect::from_min_max(pos2(body.left(), body.top() + TITLE_HEIGHT), body.max);
+            // 소리를 끈 클립은 회색으로 칠한다
+            lanes.rect_filled(body, 3.0, if clip.muted { Color32::from_gray(75) } else { color });
+            // 제목은 막대의 왼쪽 끝에 붙인다. 막대의 앞부분이 화면 밖이면 보이는 곳의 왼쪽 끝에 붙는다
+            let mut label = marks.labels.get(&clip.id).cloned().unwrap_or_default();
+            if clip.speed_pct != 100 {
+                label += &format!("  {}%", clip.speed_pct);
+            }
+            let (title_fill, title_text) = if selected {
+                (Color32::from_rgb(250, 250, 250), Color32::BLACK)
+            } else if linked.contains(&clip.id) {
+                (Color32::from_black_alpha(90), Color32::WHITE)
+            } else {
+                (Color32::from_black_alpha(130), Color32::from_gray(225))
+            };
+            let galley = lanes.layout_no_wrap(label, FontId::proportional(11.0), title_text);
+            let title_left = body.left().max(lane.left());
+            let title_right = (title_left + galley.size().x + 10.0).min(body.right());
+            let title = Rect::from_min_max(pos2(title_left, body.top()), pos2(title_right, body.bottom()));
+            let content = Rect::from_min_max(pos2(title.right(), body.top()), body.max);
             if let Some((peaks, stream_start)) = waves.get(&(clip.media, clip.stream)).filter(|_| track.kind == TrackKind::Audio) {
                 // 화면 왼쪽 끝 시각에 해당하는 원본 위치(초). 속도를 바꾼 클립은 원본이 그만큼 빨리 지나간다
                 let speed = clip.speed_pct as f64 / 100.0;
                 let source_at_scroll = flicks_to_secs(clip.src_in - stream_start) + (view.scroll - flicks_to_secs(clip.start)) * speed;
                 draw_wave(&lanes, content.intersect(lane), lane.left(), (view.px_per_sec as f64 / speed) as f32, source_at_scroll, peaks);
             }
-            // 제목 띠: 선택한 클립은 밝게 칠해서 한눈에 보이게 한다
-            let title = Rect::from_min_max(body.min, pos2(body.right(), body.top() + TITLE_HEIGHT));
-            let (title_fill, title_text) = if selected {
-                (Color32::from_rgb(250, 250, 250), Color32::BLACK)
-            } else if linked.contains(&clip.id) {
-                (Color32::from_black_alpha(60), Color32::WHITE)
-            } else {
-                (Color32::from_black_alpha(110), Color32::from_gray(225))
-            };
+            // 선택한 클립은 제목을 밝게 칠해서 한눈에 보이게 한다
             lanes.rect_filled(title, 3.0, title_fill);
-            if let Some(label) = marks.labels.get(&clip.id) {
-                let mut text = label.clone();
-                if clip.speed_pct != 100 {
-                    text += &format!("  {}%", clip.speed_pct);
-                }
-                let visible = title.intersect(lane).shrink2(vec2(3.0, 0.0));
-                lanes.with_clip_rect(visible).text(visible.left_center(), Align2::LEFT_CENTER, text, FontId::proportional(11.0), title_text);
-            }
+            let text_at = pos2(title.left() + 5.0, title.center().y - galley.size().y * 0.5);
+            lanes.with_clip_rect(title.intersect(lane)).galley(text_at, galley, title_text);
             let outline = if selected {
                 Stroke::new(2.0_f32, Color32::WHITE)
             } else if linked.contains(&clip.id) {
@@ -329,7 +330,10 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
         if track.kind == TrackKind::Audio {
             // 믹서 대신: 트랙마다 소리를 바로 켜고 끈다
             let button = Rect::from_center_size(pos2(header.right() - 22.0, header.center().y), vec2(36.0, 18.0));
-            let (fill, text) = if track.muted { (Color32::from_gray(70), "꺼짐") } else { (Color32::from_rgb(45, 120, 85), "켜짐") };
+            // 이 트랙에서 고른 클립이 있으면 그 클립의 상태를, 없으면 트랙 전체의 상태를 보여 준다
+            let chosen = marks.clip.and_then(|id| project.clip(id).ok()).filter(|c| c.track == track.id);
+            let off = chosen.map_or(track.muted, |c| c.muted);
+            let (fill, text) = if off { (Color32::from_gray(70), "꺼짐") } else { (Color32::from_rgb(45, 120, 85), "켜짐") };
             painter.rect_filled(button, 4.0, fill);
             painter.text(button.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), Color32::WHITE);
             mutes.push((track.id, button));

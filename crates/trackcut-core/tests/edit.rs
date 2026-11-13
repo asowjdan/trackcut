@@ -459,3 +459,17 @@ fn project_file_without_edit_tracks_still_loads() {
     assert!(!text.contains("edit_of"), "원본 트랙에는 편집본 표시를 쓰지 않는다");
     assert_eq!(serde_json::from_str::<Project>(&text).unwrap(), p);
 }
+
+#[test]
+fn muting_a_clip_leaves_the_rest_of_the_track_on() {
+    let mut p = Project::from_media(media(600, 1), None);
+    p.split_at(f(100), None).unwrap();
+    let pieces = clips_on(&p, 1);
+    p.set_clip_muted(pieces[0].0, true).unwrap();
+    assert!(p.clip(pieces[0].0).unwrap().muted);
+    assert!(!p.clip(pieces[1].0).unwrap().muted);
+    assert!(!p.timeline.tracks[1].muted, "트랙 전체 음소거는 건드리지 않는다");
+    // 나눈 조각은 꺼진 상태를 이어받는다
+    let right = p.split_at(f(50), Some(pieces[0].0)).unwrap();
+    assert!(right.iter().all(|&id| p.clip(id).unwrap().muted || p.clip(id).unwrap().track != p.timeline.tracks[1].id));
+}
