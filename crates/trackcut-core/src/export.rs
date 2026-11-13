@@ -77,7 +77,9 @@ fn sorted_clips(project: &Project, track: u64) -> Vec<&Clip> {
 }
 
 fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
-    let total = project.duration();
+    // 편집본 묶음에 올린 것이 있으면 편집본을, 없으면 원본 묶음을 내보낸다
+    let edit = project.has_edit();
+    let total = project.group_duration(edit);
     if total <= 0 {
         return edit_err("내보낼 내용이 없다");
     }
@@ -96,7 +98,7 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
         .timeline
         .tracks
         .iter()
-        .find(|t| t.kind == TrackKind::Video && project.timeline.clips.iter().any(|c| c.track == t.id));
+        .find(|t| t.kind == TrackKind::Video && t.is_edit() == edit && project.timeline.clips.iter().any(|c| c.track == t.id));
     if let (Some(track), true) = (video_track, options.audio != AudioMode::WavPerTrack) {
         let mut labels = Vec::new();
         let mut cursor = 0;
@@ -142,7 +144,7 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
     }
 
     let fade = options.fade_ms as i64 * FLICKS_PER_SEC / 1000;
-    for track in project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
+    for track in project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio && t.is_edit() == edit) {
         if options.audio == AudioMode::Mix && !project.is_audible(track.id) {
             continue;
         }
@@ -243,7 +245,7 @@ fn build_args(project: &Project, options: &ExportOptions, graph: &Graph, encoder
     }
     args.push("-filter_complex".into());
     args.push(graph.filters.join(";").into());
-    let total = secs(project.duration());
+    let total = secs(project.group_duration(project.has_edit()));
     let mut push = |items: &[&str]| args.extend(items.iter().map(|s| OsString::from(*s)));
 
     if options.audio == AudioMode::WavPerTrack {
@@ -339,7 +341,7 @@ pub fn export(
     let mut last_error = None;
     for encoder in encoders {
         let args = build_args(project, options, &graph, encoder)?;
-        match run(&args, project.duration(), cancel, &mut progress) {
+        match run(&args, project.group_duration(project.has_edit()), cancel, &mut progress) {
             Ok(()) => return Ok(outputs),
             Err(e) => {
                 // 실패하거나 취소된 출력은 남기지 않는다

@@ -82,9 +82,121 @@ impl Project {
         Ok(targets.into_iter().map(|i| self.cut_right(i, t, t, t, &mut links)).collect())
     }
 
+    /// `tracks`에 있는 클립만 시각 `t`에서 나눈다.
+    fn split_in(&mut self, t: Flicks, tracks: &[u64]) {
+        let clips = self.timeline.clips.iter().enumerate();
+        let targets: Vec<usize> = clips.filter(|(_, c)| c.start < t && t < c.end() && tracks.contains(&c.track)).map(|(i, _)| i).collect();
+        let mut links = HashMap::new();
+        for i in targets {
+            self.cut_right(i, t, t, t, &mut links);
+        }
+    }
+
+    /// 구간 `[a, b)`의 양 끝에서 `tracks`의 클립을 나누고, 그 안에 들어온 조각을 전부 하나의
+    /// 연결 묶음으로 만든다. 구간이 여러 영상에 걸쳐 있어도 한 덩어리로 선택되고 움직인다.
+    /// 묶인 조각의 id를 돌려준다.
+    pub fn split_range(&mut self, a: Flicks, b: Flicks, tracks: &[u64]) -> Result<Vec<u64>> {
+        if a >= b {
+            return edit_err("구간의 끝이 시작보다 뒤여야 한다");
+        }
+        self.split_in(a, tracks);
+        self.split_in(b, tracks);
+        let inside = |c: &Clip| tracks.contains(&c.track) && c.start >= a && c.end() <= b;
+        if !self.timeline.clips.iter().any(inside) {
+            return edit_err("구역 안에 클립이 없다");
+        }
+        let link = Some(self.timeline.alloc());
+        let mut ids = Vec::new();
+        for clip in self.timeline.clips.iter_mut().filter(|c| inside(c)) {
+            clip.link = link;
+            ids.push(clip.id);
+        }
+        Ok(ids)
+    }
+
+    /// 연결 묶음이 타임라인에서 차지하는 범위(가장 이른 시작, 가장 늦은 끝).
+    pub fn group_span(&self, id: u64) -> Result<(Flicks, Flicks)> {
+        let group = self.group(id)?;
+        let members = || self.timeline.clips.iter().filter(|c| group.contains(&c.id));
+        Ok((members().map(|c| c.start).min().unwrap_or(0), members().map(Clip::end).max().unwrap_or(0)))
+    }
+
+    /// 편집본 묶음에서 원본 트랙 `source`의 짝이 되는 트랙. 없으면 만든다.
+    /// 편집본 트랙은 원본 트랙들 아래에 원본과 같은 순서로 놓인다.
+    fn edit_track_for(&mut self, source: u64) -> Result<u64> {
+        if let Some(track) = self.timeline.tracks.iter().find(|t| t.edit_of == Some(source)) {
+            return Ok(track.id);
+        }
+        let order = |tracks: &[Track], id: u64| tracks.iter().position(|t| t.id == id);
+        let Some(rank) = order(&self.timeline.tracks, source) else {
+            return edit_err(format!("트랙 {source}이(가) 없다"));
+        };
+        let original = self.timeline.tracks[rank].clone();
+        let id = self.timeline.alloc();
+        let tracks = &self.timeline.tracks;
+        // 짝인 원본이 더 아래에 있는 첫 편집본 트랙 앞에 넣는다
+        let later = |t: &Track| t.edit_of.and_then(|s| order(tracks, s)).is_some_and(|r| r > rank);
+        let at = tracks.iter().position(later).unwrap_or(tracks.len());
+        let track = Track { id, name: format!("편집 · {}", original.name), solo: false, edit_of: Some(source), ..original };
+        self.timeline.tracks.insert(at, track);
+        Ok(id)
+    }
+
+    /// 원본 묶음의 구간 `[a, b)`를 편집본 묶음에 복사한다. 원본은 그대로 남는다.
+    /// 복사한 조각들은 하나의 연결 묶음이 되어 `at`부터 놓이고, 그 자리가 다른 편집본 클립과
+    /// 겹치면 편집본의 맨 끝에 놓인다. 새 클립의 id를 돌려준다.
+    pub fn copy_to_edit(&mut self, a: Flicks, b: Flicks, at: Flicks) -> Result<Vec<u64>> {
+        if a >= b {
+            return edit_err("구간의 끝이 시작보다 뒤여야 한다");
+        }
+        let sources: Vec<Clip> = self.timeline.clips.iter().filter(|c| !self.in_edit(c) && c.start < b && a < c.end()).cloned().collect();
+        if sources.is_empty() {
+            return edit_err("복사할 내용이 없다");
+        }
+        let mut pieces = Vec::new();
+        for source in sources {
+            let (from, to) = (source.start.max(a), source.end().min(b));
+            let mut piece = source.clone();
+            // 잘리지 않은 쪽은 원본 값을 그대로 써서 반올림 오차가 생기지 않게 한다
+            if from > source.start {
+                piece.src_in = source.src_at(from);
+            }
+            if to < source.end() {
+                piece.src_out = source.src_at(to);
+            }
+            piece.start = from - a;
+            piece.track = self.edit_track_for(source.track)?;
+            if !piece.is_empty() {
+                pieces.push(piece);
+            }
+        }
+        let clash = |p: &Project, at: Flicks| pieces.iter().any(|c| p.overlaps(c.track, at + c.start, at + c.end(), &[]));
+        let at = if clash(self, at.max(0)) { self.group_duration(true) } else { at.max(0) };
+        let link = Some(self.timeline.alloc());
+        let mut ids = Vec::new();
+        for mut piece in pieces {
+            piece.id = self.timeline.alloc();
+            piece.start += at;
+            piece.link = link;
+            ids.push(piece.id);
+            self.timeline.clips.push(piece);
+        }
+        Ok(ids)
+    }
+
     /// 구간 `[a, b)`를 지운다. `ripple`이면 뒤쪽 클립을 당겨 빈자리를 메운다.
     /// `tracks`를 주면 그 트랙만 편집하고(예: 마이크만 삭제), 건드린 클립은 연결이 풀린다.
     pub fn delete_range(&mut self, a: Flicks, b: Flicks, tracks: Option<&[u64]>, ripple: bool) -> Result<()> {
+        self.delete_impl(a, b, tracks, ripple, tracks.is_some())
+    }
+
+    /// `delete_range`와 같지만 한 묶음(원본 또는 편집본)의 트랙 전체를 지우는 경우에 쓴다.
+    /// 건드린 클립의 연결을 풀지 않는다.
+    pub fn delete_range_in(&mut self, a: Flicks, b: Flicks, tracks: &[u64], ripple: bool) -> Result<()> {
+        self.delete_impl(a, b, Some(tracks), ripple, false)
+    }
+
+    fn delete_impl(&mut self, a: Flicks, b: Flicks, tracks: Option<&[u64]>, ripple: bool, unlink: bool) -> Result<()> {
         if a >= b {
             return edit_err("구간의 끝이 시작보다 뒤여야 한다");
         }
@@ -120,7 +232,7 @@ impl Project {
             }
         }
         self.timeline.clips.retain(|c| !removed.contains(&c.id));
-        if tracks.is_some() {
+        if unlink {
             for clip in self.timeline.clips.iter_mut().filter(|c| touched.contains(&c.id)) {
                 clip.link = None;
             }
@@ -220,24 +332,22 @@ impl Project {
     }
 
     /// 클립(과 연결된 묶음)의 자리를 같은 트랙의 바로 뒤(`forward`)나 바로 앞 클립 묶음과 바꾼다.
-    /// 두 묶음 사이의 빈 구간은 그대로 둔다.
+    /// 묶음은 차지하는 범위 전체가 통째로 움직이고, 두 묶음 사이의 빈 구간은 그대로 둔다.
     pub fn swap_with_neighbor(&mut self, id: u64, forward: bool) -> Result<()> {
-        let anchor = self.clip(id)?.clone();
-        let same_track = self.timeline.clips.iter().filter(|c| c.track == anchor.track && c.id != anchor.id);
+        let track = self.clip(id)?.track;
+        let (group, span) = (self.group(id)?, self.group_span(id)?);
+        let others = self.timeline.clips.iter().filter(|c| c.track == track && !group.contains(&c.id));
         let neighbor = if forward {
-            same_track.filter(|c| c.start >= anchor.end()).min_by_key(|c| c.start)
+            others.filter(|c| c.start >= span.1).min_by_key(|c| c.start)
         } else {
-            same_track.filter(|c| c.end() <= anchor.start).max_by_key(|c| c.start)
+            others.filter(|c| c.end() <= span.0).max_by_key(|c| c.start)
         };
-        let Some(neighbor) = neighbor.cloned() else {
+        let Some(neighbor) = neighbor.map(|c| c.id) else {
             return edit_err("자리를 바꿀 이웃 클립이 없다");
         };
-        let (first, second) = if forward { (anchor, neighbor) } else { (neighbor, anchor) };
-        let (front, back) = (self.group(first.id)?, self.group(second.id)?);
-        if front.iter().any(|c| back.contains(c)) {
-            return edit_err("연결된 클립끼리는 자리를 바꿀 수 없다");
-        }
-        let (to_back, to_front) = (second.end() - first.end(), first.start - second.start);
+        let (other, other_span) = (self.group(neighbor)?, self.group_span(neighbor)?);
+        let (front, back, first, second) = if forward { (group, other, span, other_span) } else { (other, group, other_span, span) };
+        let (to_back, to_front) = (second.1 - first.1, first.0 - second.0);
         for c in self.timeline.clips.iter_mut() {
             if front.contains(&c.id) {
                 c.start += to_back;
@@ -263,7 +373,7 @@ impl Project {
         let source = self.timeline.tracks[position].clone();
         let track = self.timeline.alloc();
         let name = format!("{} (보정)", source.name);
-        self.timeline.tracks.insert(position + 1, Track { id: track, kind: TrackKind::Audio, name, volume_db: source.volume_db, muted: false, solo: false });
+        self.timeline.tracks.insert(position + 1, Track { id: track, kind: TrackKind::Audio, name, volume_db: source.volume_db, muted: false, solo: false, edit_of: source.edit_of });
         let mut added = Vec::new();
         for (media, stream, info) in sources {
             let old_start = self.media_info(media).and_then(|m| m.audio.iter().find(|a| a.audio_index == stream)).map(|a| a.start);
@@ -308,8 +418,15 @@ impl Project {
         let old_end = anchor.end();
         let exact = Clip { speed_pct: pct, ..anchor.clone() }.len();
         let new_end = anchor.start + frame_time(floor_frame(exact, fps).max(1), fps);
+        // 묶음 가운데 이 클립과 같은 시간대에 있는 것만 속도를 바꾼다(여러 조각을 묶은 구간은 조각마다 바꾼다)
+        let beside = |c: &Clip| group.contains(&c.id) && c.start < old_end && anchor.start < c.end();
+        // 뒤쪽 클립은 같은 묶음(원본 또는 편집본) 안에서만 밀린다
+        let same_side = self.group_tracks(self.in_edit(&anchor));
         for c in self.timeline.clips.iter_mut() {
-            if group.contains(&c.id) {
+            if !same_side.contains(&c.track) {
+                continue;
+            }
+            if beside(c) {
                 let follows = c.id == id || c.end() == old_end;
                 c.speed_pct = pct;
                 if follows {
@@ -370,8 +487,14 @@ impl Project {
     }
 
     /// 지금 소리가 나는 트랙인지. 솔로인 트랙이 하나라도 있으면 솔로 트랙만 들린다.
+    /// 솔로는 같은 묶음(원본 또는 편집본) 안에서만 따진다.
     pub fn is_audible(&self, track: u64) -> bool {
-        let any_solo = self.timeline.tracks.iter().any(|t| t.solo);
-        self.track(track).is_some_and(|t| if any_solo { t.solo } else { !t.muted })
+        let Some(track) = self.track(track) else { return false };
+        let any_solo = self.timeline.tracks.iter().any(|t| t.solo && t.is_edit() == track.is_edit());
+        if any_solo {
+            track.solo
+        } else {
+            !track.muted
+        }
     }
 }

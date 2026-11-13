@@ -42,6 +42,16 @@ pub struct Track {
     pub volume_db: f32,
     pub muted: bool,
     pub solo: bool,
+    /// 편집본 트랙이면 짝이 되는 원본 트랙. 원본 트랙은 None이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_of: Option<u64>,
+}
+
+impl Track {
+    /// 편집본 묶음의 트랙인지(아니면 원본 묶음).
+    pub fn is_edit(&self) -> bool {
+        self.edit_of.is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -198,7 +208,7 @@ impl Project {
                 0 => "영상".to_string(),
                 n => format!("영상 {}", n + 1),
             };
-            let existing = self.timeline.tracks.iter().find(|t| reuse && t.kind == TrackKind::Video).map(|t| t.id);
+            let existing = self.timeline.tracks.iter().find(|t| reuse && !t.is_edit() && t.kind == TrackKind::Video).map(|t| t.id);
             let track = existing.unwrap_or_else(|| self.add_track(TrackKind::Video, name, false));
             let (src_in, src_out) = (v.grid.start(), v.grid.end());
             let id = self.timeline.alloc();
@@ -211,7 +221,7 @@ impl Project {
                 .map(|l| l.name.clone())
                 .or_else(|| a.title.clone())
                 .unwrap_or_else(|| default_name(a.audio_index + 1));
-            let audio_tracks = self.timeline.tracks.iter().filter(|t| reuse && t.kind == TrackKind::Audio);
+            let audio_tracks = self.timeline.tracks.iter().filter(|t| reuse && !t.is_edit() && t.kind == TrackKind::Audio);
             let existing = audio_tracks.map(|t| t.id).nth(a.audio_index as usize);
             let track = existing.unwrap_or_else(|| self.add_track(TrackKind::Audio, name, label.is_some_and(|l| l.default_muted)));
             // 영상보다 먼저 시작하는 부분은 잘라내고, 늦게 시작하면 그만큼 뒤에 놓는다
@@ -239,14 +249,36 @@ impl Project {
         media_id
     }
 
+    /// 원본 트랙을 하나 만든다. 편집본 트랙이 이미 있으면 그 앞에 넣어 원본 묶음이 위에 모이게 한다.
     fn add_track(&mut self, kind: TrackKind, name: String, muted: bool) -> u64 {
         let id = self.timeline.alloc();
-        self.timeline.tracks.push(Track { id, kind, name, volume_db: 0.0, muted, solo: false });
+        let at = self.timeline.tracks.iter().position(Track::is_edit).unwrap_or(self.timeline.tracks.len());
+        self.timeline.tracks.insert(at, Track { id, kind, name, volume_db: 0.0, muted, solo: false, edit_of: None });
         id
     }
 
     fn track_count(&self, kind: TrackKind) -> usize {
-        self.timeline.tracks.iter().filter(|t| t.kind == kind).count()
+        self.timeline.tracks.iter().filter(|t| t.kind == kind && !t.is_edit()).count()
+    }
+
+    /// 원본 묶음(`edit`이 false)이나 편집본 묶음의 트랙 id들.
+    pub fn group_tracks(&self, edit: bool) -> Vec<u64> {
+        self.timeline.tracks.iter().filter(|t| t.is_edit() == edit).map(|t| t.id).collect()
+    }
+
+    /// 클립이 편집본 묶음에 있는지.
+    pub fn in_edit(&self, clip: &Clip) -> bool {
+        self.track(clip.track).is_some_and(Track::is_edit)
+    }
+
+    /// 편집본 묶음에 클립이 하나라도 있는지. 있으면 내보내기는 편집본을 내보낸다.
+    pub fn has_edit(&self) -> bool {
+        self.timeline.clips.iter().any(|c| self.in_edit(c))
+    }
+
+    /// 한 묶음(원본 또는 편집본)의 길이.
+    pub fn group_duration(&self, edit: bool) -> Flicks {
+        self.timeline.clips.iter().filter(|c| self.in_edit(c) == edit).map(Clip::end).max().unwrap_or(0)
     }
 
     pub fn track(&self, id: u64) -> Option<&Track> {

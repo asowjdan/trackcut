@@ -346,3 +346,116 @@ fn processed_audio_goes_on_a_new_track_and_the_original_stays() {
     assert!(p.timeline.clips.iter().filter(|c| c.track == track).all(|c| c.media == 2 && c.stream == 0));
     assert_eq!(spans(&p, 1), [(0, f(100)), (f(100), f(600))], "원본 클립은 그대로다");
 }
+
+/// 두 파일을 이어 붙인 프로젝트(각 600프레임, 오디오 1개)와 원본 트랙들.
+fn two_files() -> (Project, Vec<u64>) {
+    let mut p = Project::from_media(media(600, 1), None);
+    p.append_media(media(600, 1), None);
+    let tracks = p.group_tracks(false);
+    (p, tracks)
+}
+
+#[test]
+fn region_split_across_two_files_makes_one_linked_section() {
+    let (mut p, tracks) = two_files();
+    let section = p.split_range(f(500), f(700), &tracks).unwrap();
+    assert_eq!(spans(&p, 0), [(0, f(500)), (f(500), f(600)), (f(600), f(700)), (f(700), f(1200))]);
+    assert_eq!(section.len(), 4, "영상 조각 2개와 오디오 조각 2개가 한 구간이 된다");
+    let inside = clips_on(&p, 0)[1].0;
+    let mut group = p.group(inside).unwrap();
+    group.sort();
+    let mut expected = section.clone();
+    expected.sort();
+    assert_eq!(group, expected);
+    assert_eq!(p.group_span(inside).unwrap(), (f(500), f(700)));
+    // 바깥 조각은 구간에 들어가지 않는다
+    assert!(!group.contains(&clips_on(&p, 0)[0].0) && !group.contains(&clips_on(&p, 0)[3].0));
+}
+
+#[test]
+fn linked_section_swaps_places_as_one_block() {
+    let (mut p, tracks) = two_files();
+    p.split_range(f(500), f(700), &tracks).unwrap();
+    let inside = clips_on(&p, 0)[1].0;
+    p.swap_with_neighbor(inside, true).unwrap();
+    assert_eq!(p.group_span(inside).unwrap(), (f(1000), f(1200)));
+    assert_eq!(spans(&p, 0), [(0, f(500)), (f(500), f(1000)), (f(1000), f(1100)), (f(1100), f(1200))]);
+    assert_eq!(spans(&p, 1), spans(&p, 0));
+}
+
+#[test]
+fn region_split_rejects_an_empty_region() {
+    let (mut p, tracks) = two_files();
+    assert!(p.split_range(f(700), f(500), &tracks).is_err());
+    assert!(p.split_range(f(1300), f(1400), &tracks).is_err(), "클립이 없는 구간");
+}
+
+#[test]
+fn copy_to_edit_puts_a_linked_copy_on_edit_tracks_and_keeps_the_source() {
+    let (mut p, tracks) = two_files();
+    let before = p.timeline.clips.clone();
+    let copies = p.copy_to_edit(f(500), f(700), f(0)).unwrap();
+    assert_eq!(copies.len(), 4);
+    assert_eq!(&p.timeline.clips[..before.len()], &before[..], "원본 클립은 그대로다");
+    assert_eq!(p.group_tracks(false), tracks);
+    let edit = p.group_tracks(true);
+    assert_eq!(edit.len(), 2, "원본 트랙마다 편집본 트랙이 하나씩 생긴다");
+    assert_eq!(p.timeline.tracks[2].kind, TrackKind::Video);
+    assert_eq!(p.timeline.tracks[2].edit_of, Some(tracks[0]));
+    assert_eq!(p.timeline.tracks[3].edit_of, Some(tracks[1]));
+    assert_eq!(spans(&p, 2), [(0, f(100)), (f(100), f(200))]);
+    assert_eq!(spans(&p, 3), spans(&p, 2));
+    let first = p.clip(clips_on(&p, 2)[0].0).unwrap();
+    assert_eq!((first.src_in, first.src_out), (f(500), f(600)));
+    assert_eq!(p.group_span(copies[0]).unwrap(), (0, f(200)), "복사한 조각은 한 묶음이다");
+    assert!(p.has_edit());
+    assert_eq!((p.group_duration(false), p.group_duration(true)), (f(1200), f(200)));
+}
+
+#[test]
+fn copy_to_edit_goes_to_the_end_when_the_spot_is_taken() {
+    let (mut p, _) = two_files();
+    p.copy_to_edit(f(0), f(100), f(50)).unwrap();
+    p.copy_to_edit(f(300), f(400), f(100)).unwrap();
+    assert_eq!(spans(&p, 2), [(f(50), f(150)), (f(150), f(250))]);
+    p.copy_to_edit(f(300), f(400), f(400)).unwrap();
+    assert_eq!(spans(&p, 2), [(f(50), f(150)), (f(150), f(250)), (f(400), f(500))]);
+    assert_eq!(p.group_tracks(true).len(), 2, "편집본 트랙을 다시 만들지 않는다");
+    assert!(p.copy_to_edit(f(2000), f(2100), 0).is_err(), "원본에 내용이 없는 구간");
+}
+
+#[test]
+fn edits_on_one_side_leave_the_other_side_alone() {
+    let (mut p, tracks) = two_files();
+    p.copy_to_edit(f(0), f(300), f(0)).unwrap();
+    // 원본에서 구역을 지워도 편집본은 그대로다
+    p.delete_range_in(f(100), f(200), &tracks, true).unwrap();
+    assert_eq!(p.group_duration(false), f(1100));
+    assert_eq!(spans(&p, 2), [(0, f(300))]);
+    // 편집본 클립의 속도를 바꿔도 원본은 밀리지 않는다
+    let copy = clips_on(&p, 2)[0].0;
+    p.set_speed(copy, 200).unwrap();
+    assert_eq!(spans(&p, 2), [(0, f(150))]);
+    assert_eq!(p.group_duration(false), f(1100));
+    // 새 파일은 원본 묶음의 트랙에 이어 붙는다
+    p.append_media(media(60, 1), None);
+    assert_eq!(p.group_tracks(false), tracks);
+    assert_eq!(p.group_duration(false), f(1160));
+}
+
+#[test]
+fn solo_only_silences_tracks_on_the_same_side() {
+    let (mut p, tracks) = two_files();
+    p.copy_to_edit(f(0), f(100), 0).unwrap();
+    let edit_audio = p.group_tracks(true)[1];
+    p.set_solo(tracks[1], true).unwrap();
+    assert!(p.is_audible(edit_audio));
+}
+
+#[test]
+fn project_file_without_edit_tracks_still_loads() {
+    let p = Project::from_media(media(60, 1), None);
+    let text = serde_json::to_string(&p).unwrap();
+    assert!(!text.contains("edit_of"), "원본 트랙에는 편집본 표시를 쓰지 않는다");
+    assert_eq!(serde_json::from_str::<Project>(&text).unwrap(), p);
+}

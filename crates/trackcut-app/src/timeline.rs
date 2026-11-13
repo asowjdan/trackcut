@@ -98,9 +98,27 @@ pub enum Action {
     Unlink(u64),
 }
 
-/// 클립마다 붙일 제목. 같은 파일에서 나온 조각이 여럿이면 "영상 1 · 분할 2"처럼 번호를 붙인다.
+/// 여러 조각을 하나로 묶은 구간들: 연결 번호 → 구간 번호(1부터, 시작 시각 순).
+/// 한 트랙에 조각이 둘 이상 들어 있는 연결 묶음이 구간이다(여러 영상에 걸친 구역을 분할한 결과).
+fn sections(project: &Project) -> HashMap<u64, usize> {
+    let clips = &project.timeline.clips;
+    let mut found: Vec<(Flicks, u64)> = Vec::new();
+    for clip in clips {
+        let Some(link) = clip.link else { continue };
+        let same = |c: &&Clip| c.link == Some(link);
+        if found.iter().all(|f| f.1 != link) && clips.iter().filter(same).any(|c| c.id != clip.id && c.track == clip.track) {
+            found.push((clips.iter().filter(same).map(|c| c.start).min().unwrap_or(0), link));
+        }
+    }
+    found.sort();
+    found.into_iter().enumerate().map(|(number, (_, link))| (link, number + 1)).collect()
+}
+
+/// 클립마다 붙일 제목. 같은 파일에서 나온 조각이 여럿이면 "영상 1 · 분할 2"처럼 번호를 붙이고,
+/// 여러 조각을 묶은 구간에 든 클립은 앞에 "구간 N"을 붙인다.
 pub fn clip_labels(project: &Project) -> HashMap<u64, String> {
     let mut labels = HashMap::new();
+    let sections = sections(project);
     for track in &project.timeline.tracks {
         let mut clips: Vec<&Clip> = project.timeline.clips.iter().filter(|c| c.track == track.id).collect();
         clips.sort_by_key(|c| c.start);
@@ -111,6 +129,10 @@ pub fn clip_labels(project: &Project) -> HashMap<u64, String> {
                 let label = match pieces.len() {
                     1 => format!("{kind} {}", number + 1),
                     _ => format!("{kind} {} · 분할 {}", number + 1, piece + 1),
+                };
+                let label = match clip.link.and_then(|link| sections.get(&link)) {
+                    Some(section) => format!("구간 {section} · {label}"),
+                    None => label,
                 };
                 labels.insert(clip.id, label);
             }

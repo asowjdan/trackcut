@@ -217,7 +217,7 @@ impl TrackcutApp {
                 (self.wanted, self.shown, self.region) = (None, None, None);
                 self.regions.clear();
                 self.crop_mode = self.options.crop;
-                if let Some([a, b]) = self.options.region {
+                for [a, b] in self.options.regions.clone() {
                     self.regions.push((secs_to_flicks(a), secs_to_flicks(b)));
                     self.region = Some(0);
                 }
@@ -226,6 +226,17 @@ impl TrackcutApp {
                 self.status = "열었다".into();
             }
             Err(e) => self.status = format!("열 수 없음: {e}"),
+        }
+    }
+
+    /// 실행 인자로 받은 확인용 동작. 파일을 전부 올린 뒤에 한 번 실행한다.
+    fn startup_actions(&mut self) {
+        let idle = self.loading.is_none() && self.adding.is_none() && self.queue.is_empty();
+        if !idle || self.project.is_none() {
+            return;
+        }
+        if std::mem::take(&mut self.options.split) {
+            self.split_region(0);
         }
     }
 
@@ -304,18 +315,19 @@ impl TrackcutApp {
         (self.wanted, self.shown) = (None, None);
     }
 
-    /// 구역의 양 끝에서 클립을 나눠, 구역이 따로 떨어진 조각이 되게 한다.
+    /// 구역의 양 끝에서 클립을 나눠, 구역 안쪽이 따로 떨어진 하나의 구간이 되게 한다.
+    /// 구역이 여러 영상에 걸쳐 있어도 그 안의 조각들은 한 묶음으로 선택되고 움직인다.
     fn split_region(&mut self, index: usize) {
         let Some(&(a, b)) = self.regions.get(index) else { return };
         let done = self.edit("구역 분할", |p| {
-            p.split_at(a, None)?;
-            p.split_at(b, None).map(|_| ())
+            let tracks = p.group_tracks(false);
+            p.split_range(a, b, &tracks)
         });
-        // 나뉜 조각을 바로 고칠 수 있게 선택한다
-        if let (Some(()), Some(project)) = (done, &self.project) {
-            let is_video = |c: &&Clip| project.track(c.track).is_some_and(|t| t.kind == TrackKind::Video);
-            let starts_here = || project.timeline.clips.iter().filter(|c| c.start == a);
-            if let Some(clip) = starts_here().find(is_video).or_else(|| starts_here().next()) {
+        // 나뉜 구간을 바로 고칠 수 있게 선택한다
+        if let (Some(pieces), Some(project)) = (done, &self.project) {
+            let mut clips: Vec<&Clip> = pieces.iter().filter_map(|&id| project.clip(id).ok()).collect();
+            clips.sort_by_key(|c| (project.track(c.track).is_none_or(|t| t.kind != TrackKind::Video), c.start));
+            if let Some(clip) = clips.first() {
                 (self.selected_clip, self.selected_track) = (Some(clip.id), Some(clip.track));
             }
         }
@@ -665,6 +677,7 @@ impl eframe::App for TrackcutApp {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         self.queue.extend(dropped);
         self.next_file(ctx);
+        self.startup_actions();
         self.handle_keys(ctx);
 
         let now = Instant::now();
