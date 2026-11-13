@@ -6,6 +6,7 @@ pub mod decode;
 pub mod edit;
 pub mod error;
 pub mod export;
+pub mod fx;
 pub mod history;
 pub mod labels;
 pub mod media;

@@ -314,3 +314,35 @@ fn keyed_edits_merge_into_one_undo_step() {
     assert_eq!(p.timeline.tracks[1].volume_db, 0.0);
     assert!(!history.can_undo());
 }
+
+#[test]
+fn swapping_neighbors_reorders_linked_pieces_together() {
+    let mut p = Project::from_media(media(600, 1), None);
+    p.split_at(f(100), None).unwrap();
+    let first = clips_on(&p, 0)[0].0;
+    p.swap_with_neighbor(first, true).unwrap();
+    assert_eq!(spans(&p, 0), [(0, f(500)), (f(500), f(600))]);
+    assert_eq!(spans(&p, 1), [(0, f(500)), (f(500), f(600))]);
+    assert_eq!(p.clip(first).unwrap().start, f(500));
+    assert!(p.swap_with_neighbor(first, true).is_err(), "맨 뒤에서는 더 뒤로 갈 수 없다");
+    p.swap_with_neighbor(first, false).unwrap();
+    assert_eq!(p.clip(first).unwrap().start, 0);
+}
+
+#[test]
+fn processed_audio_goes_on_a_new_track_and_the_original_stays() {
+    let mut p = Project::from_media(media(600, 1), None);
+    p.split_at(f(100), None).unwrap();
+    let mic = p.timeline.tracks[1].id;
+    let mut fixed = media(600, 1);
+    fixed.video = None;
+    fixed.path = "recording.fixed.flac".into();
+    let track = p.add_processed_track(mic, vec![(1, 0, fixed)]).unwrap();
+    assert_eq!(p.timeline.tracks.len(), 3);
+    assert_eq!(p.timeline.tracks[2].id, track);
+    assert_eq!(p.timeline.tracks[2].name, "오디오 1 (보정)");
+    assert!(p.timeline.tracks[1].muted && !p.timeline.tracks[2].muted);
+    assert_eq!(spans(&p, 2), spans(&p, 1), "원본과 같은 자리에 놓인다");
+    assert!(p.timeline.clips.iter().filter(|c| c.track == track).all(|c| c.media == 2 && c.stream == 0));
+    assert_eq!(spans(&p, 1), [(0, f(100)), (f(100), f(600))], "원본 클립은 그대로다");
+}

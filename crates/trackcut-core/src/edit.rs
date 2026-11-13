@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use crate::error::{edit_err, Result};
-use crate::project::{Clip, Crop, Project, Track, TrackKind, SPEED_MAX_PCT, SPEED_MIN_PCT, VOLUME_MAX_DB, VOLUME_MIN_DB};
+use crate::media::MediaInfo;
+use crate::project::{Clip, Crop, MediaEntry, Project, Track, TrackKind, SPEED_MAX_PCT, SPEED_MIN_PCT, VOLUME_MAX_DB, VOLUME_MIN_DB};
 use crate::time::{floor_frame, frame_time, Flicks};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +217,79 @@ impl Project {
             self.timeline.clips[i].link = link;
         }
         Ok(())
+    }
+
+    /// 클립(과 연결된 묶음)의 자리를 같은 트랙의 바로 뒤(`forward`)나 바로 앞 클립 묶음과 바꾼다.
+    /// 두 묶음 사이의 빈 구간은 그대로 둔다.
+    pub fn swap_with_neighbor(&mut self, id: u64, forward: bool) -> Result<()> {
+        let anchor = self.clip(id)?.clone();
+        let same_track = self.timeline.clips.iter().filter(|c| c.track == anchor.track && c.id != anchor.id);
+        let neighbor = if forward {
+            same_track.filter(|c| c.start >= anchor.end()).min_by_key(|c| c.start)
+        } else {
+            same_track.filter(|c| c.end() <= anchor.start).max_by_key(|c| c.start)
+        };
+        let Some(neighbor) = neighbor.cloned() else {
+            return edit_err("자리를 바꿀 이웃 클립이 없다");
+        };
+        let (first, second) = if forward { (anchor, neighbor) } else { (neighbor, anchor) };
+        let (front, back) = (self.group(first.id)?, self.group(second.id)?);
+        if front.iter().any(|c| back.contains(c)) {
+            return edit_err("연결된 클립끼리는 자리를 바꿀 수 없다");
+        }
+        let (to_back, to_front) = (second.end() - first.end(), first.start - second.start);
+        for c in self.timeline.clips.iter_mut() {
+            if front.contains(&c.id) {
+                c.start += to_back;
+            } else if back.contains(&c.id) {
+                c.start += to_front;
+            }
+        }
+        let clips = &self.timeline.clips;
+        let clash = clips.iter().any(|a| a.start < 0 || clips.iter().any(|b| a.id != b.id && a.track == b.track && a.start < b.end() && b.start < a.end()));
+        if clash {
+            return edit_err("자리를 바꾸면 다른 클립과 겹친다");
+        }
+        Ok(())
+    }
+
+    /// 보정한 소리 파일들을 새 트랙으로 올린다. `sources`는 (원본 미디어, 오디오 스트림 번호, 보정한 파일 정보).
+    /// 새 트랙은 원본 트랙 바로 아래에 생기고 원본과 같은 자리에 같은 길이의 클립이 놓인다.
+    /// 원본 트랙은 지우지 않고 음소거만 해서, 솔로·음소거로 전후를 비교할 수 있다.
+    pub fn add_processed_track(&mut self, source_track: u64, sources: Vec<(u64, u32, MediaInfo)>) -> Result<u64> {
+        let Some(position) = self.timeline.tracks.iter().position(|t| t.id == source_track) else {
+            return edit_err(format!("트랙 {source_track}이(가) 없다"));
+        };
+        let source = self.timeline.tracks[position].clone();
+        let track = self.timeline.alloc();
+        let name = format!("{} (보정)", source.name);
+        self.timeline.tracks.insert(position + 1, Track { id: track, kind: TrackKind::Audio, name, volume_db: source.volume_db, muted: false, solo: false });
+        let mut added = Vec::new();
+        for (media, stream, info) in sources {
+            let old_start = self.media_info(media).and_then(|m| m.audio.iter().find(|a| a.audio_index == stream)).map(|a| a.start);
+            let (Some(old_start), Some(new_start)) = (old_start, info.audio.first().map(|a| a.start)) else {
+                return edit_err("보정한 파일에 소리가 없다");
+            };
+            let new_media = self.media.iter().map(|m| m.id).chain(added.iter().map(|m: &MediaEntry| m.id)).max().unwrap_or(0) + 1;
+            let originals: Vec<Clip> =
+                self.timeline.clips.iter().filter(|c| c.track == source_track && c.media == media && c.stream == stream).cloned().collect();
+            for mut clip in originals {
+                clip.id = self.timeline.alloc();
+                clip.track = track;
+                clip.media = new_media;
+                clip.stream = 0;
+                clip.src_in += new_start - old_start;
+                clip.src_out += new_start - old_start;
+                self.timeline.clips.push(clip);
+            }
+            added.push(MediaEntry { id: new_media, info });
+        }
+        if !self.timeline.clips.iter().any(|c| c.track == track) {
+            return edit_err("보정할 클립이 없다");
+        }
+        self.track_mut(source_track)?.muted = true;
+        self.media.extend(added);
+        Ok(track)
     }
 
     /// 재생 속도(%)를 바꾼다. 연결된 클립도 같은 속도가 되고, 뒤쪽 클립은 달라진 길이만큼 밀리거나

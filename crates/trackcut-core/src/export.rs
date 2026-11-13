@@ -120,7 +120,7 @@ fn build_graph(project: &Project, options: &ExportOptions) -> Result<Graph> {
             let offset = info.file_start() + half;
             let label = format!("[v{}]", labels.len());
             graph.filters.push(format!(
-                "[{input}:v:0]trim=start={}:end={},setpts=(PTS-STARTPTS)*100/{}{},scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={rate},setsar=1,format=yuv420p,trim=duration={}{label}",
+                "[{input}:v:0]trim=start={}:end={},setpts=(PTS-STARTPTS)*100/{}{},scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps={rate},setsar=1,format=yuv420p,trim=duration={}{label}",
                 secs(clip.src_in - offset),
                 secs(clip.src_out - offset),
                 clip.speed_pct,
