@@ -1,4 +1,4 @@
-//! trackcut 편집 화면: 위쪽에 미리보기, 아래쪽에 타임라인, 오른쪽에 믹서.
+//! trackcut 편집 화면: 왼쪽에 편집 패널, 위쪽에 미리보기, 아래쪽에 타임라인.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;

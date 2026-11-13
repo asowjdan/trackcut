@@ -105,6 +105,8 @@ pub enum Action {
     /// 끄는 클립의 기준점(이동: 시작, 트림: 그 경계)이 가야 할 시각
     DragTo(Flicks),
     DragEnd,
+    /// 트랙의 소리를 켜거나 끈다(트랙 이름 옆의 버튼)
+    ToggleMute(u64),
     /// 끌던 것을 없던 일로 한다
     DragCancel,
     /// 원본의 범위(시작, 끝)를 편집본의 이 시각에 복사한다
@@ -251,6 +253,8 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     let linked = marks.clip.and_then(|id| project.group(id).ok()).unwrap_or_default();
     let mut hits: Vec<Hit> = Vec::new();
     let mut headers: Vec<(u64, Rect)> = Vec::new();
+    // 오디오 트랙 이름 옆의 소리 켜기/끄기 버튼
+    let mut mutes: Vec<(u64, Rect)> = Vec::new();
 
     for track in &project.timeline.tracks {
         let Some(&top) = tops.get(&track.id) else { continue };
@@ -321,7 +325,17 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
         } else {
             style.weak_text_color()
         };
-        painter.with_clip_rect(header.shrink(4.0)).text(
+        let mut name_area = header.shrink(4.0);
+        if track.kind == TrackKind::Audio {
+            // 믹서 대신: 트랙마다 소리를 바로 켜고 끈다
+            let button = Rect::from_center_size(pos2(header.right() - 22.0, header.center().y), vec2(36.0, 18.0));
+            let (fill, text) = if track.muted { (Color32::from_gray(70), "꺼짐") } else { (Color32::from_rgb(45, 120, 85), "켜짐") };
+            painter.rect_filled(button, 4.0, fill);
+            painter.text(button.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), Color32::WHITE);
+            mutes.push((track.id, button));
+            name_area.set_right(button.left() - 4.0);
+        }
+        painter.with_clip_rect(name_area).text(
             header.left_center() + vec2(8.0, 0.0),
             Align2::LEFT_CENTER,
             &track.name,
@@ -376,7 +390,7 @@ pub fn show(ui: &mut egui::Ui, project: &Project, view: &mut View, marks: &Marks
     let x = x_of(marks.playhead);
     lanes.line_segment([pos2(x, lane.top()), pos2(x, lane.bottom())], Stroke::new(2.0_f32,Color32::from_rgb(235, 70, 70)));
 
-    let mut actions = interact(ui, &response, project, view, marks, lane, edit_top, &hits, &headers);
+    let mut actions = interact(ui, &response, project, view, marks, lane, edit_top, &hits, &headers, &mutes);
     // 편집본 위로 끌고 온 구간이 놓일 자리를 미리 보여 준다
     if let Some((copy, at)) = view.copying.and_then(|copy| copy.over.map(|at| (copy, at))) {
         let ghost = Rect::from_min_max(pos2(x_of(at), edit_top + GROUP_HEIGHT + 2.0), pos2(x_of(at + copy.range.1 - copy.range.0), edit_bottom - 2.0));
@@ -402,6 +416,7 @@ fn interact(
     edit_top: f32,
     hits: &[Hit],
     headers: &[(u64, Rect)],
+    mutes: &[(u64, Rect)],
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let (scroll, px_per_sec) = (view.scroll, view.px_per_sec);
@@ -479,7 +494,9 @@ fn interact(
         view.edge_grabbed = None;
     }
     if let Some(p) = response.interact_pointer_pos().filter(|_| response.clicked()) {
-        if let Some(&(track, _)) = headers.iter().find(|(_, r)| r.contains(p)) {
+        if let Some(&(track, _)) = mutes.iter().find(|(_, r)| r.contains(p)) {
+            actions.push(Action::ToggleMute(track));
+        } else if let Some(&(track, _)) = headers.iter().find(|(_, r)| r.contains(p)) {
             actions.push(Action::SelectTrack(track));
             if response.double_clicked() {
                 let name = project.track(track).map(|t| t.name.clone()).unwrap_or_default();
@@ -520,6 +537,9 @@ fn interact(
 
     // 커서 모양으로 잡을 수 있는 곳을 알려 준다
     let hover = ui.input(|i| i.pointer.hover_pos()).filter(|_| response.hovered());
+    if hover.is_some_and(|p| mutes.iter().any(|(_, r)| r.contains(p))) {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
     if view.edge_grabbed.is_some() || (view.grabbed.is_none() && hover.and_then(edge_at).is_some()) {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         return actions;

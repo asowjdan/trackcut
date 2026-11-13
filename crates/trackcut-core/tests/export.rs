@@ -101,3 +101,32 @@ fn exported_file_matches_the_edit_frame_for_frame() {
     drop(decoder);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn export_writes_the_edit_side_when_it_has_clips() {
+    if run_tool("ffmpeg", ["-version"]).is_err() {
+        eprintln!("ffmpeg가 없어 건너뜀");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("trackcut-export-edit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("원본.mp4");
+    make_source(&source);
+    let cancel = AtomicBool::new(false);
+
+    let mut project = Project::from_media(probe(&source).unwrap(), None);
+    // 원본의 40~60 프레임과 10~20 프레임을 차례로 편집본에 올린다
+    project.copy_to_edit(frame_time(40, FPS), frame_time(60, FPS), 0).unwrap();
+    project.copy_to_edit(frame_time(10, FPS), frame_time(20, FPS), frame_time(20, FPS)).unwrap();
+
+    let output = dir.join("편집본.mp4");
+    export(&project, &options(&output, AudioMode::Mix), &cancel, |_| {}).unwrap();
+    let (info, decoder) = decode::open(&output, 64).unwrap();
+    assert_eq!(info.video.as_ref().unwrap().grid.count(), 30, "원본 길이가 아니라 편집본 길이로 나온다");
+    for (output_frame, expected) in [(0, 40), (19, 59), (20, 10), (29, 19)] {
+        assert_eq!(source_frame_of(&decoder, output_frame), expected, "출력 프레임 {output_frame}");
+    }
+    assert_eq!(info.audio.len(), 1);
+    drop(decoder);
+    let _ = std::fs::remove_dir_all(&dir);
+}

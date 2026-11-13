@@ -1,10 +1,8 @@
-//! 왼쪽 패널. 선택한 것에 따라 내용이 바뀐다: 영상 클립이면 영상 편집, 오디오면 오디오 편집.
-//!
-//! 숫자 칸은 끌거나 직접 입력해 고친다. 한 칸을 연달아 고친 것은 Undo 한 단계로 묶인다.
+//! 편집 패널. 선택한 것에 따라 내용이 바뀐다: 영상 클립이면 영상 편집, 오디오면 오디오 편집
+//! (둘의 내용은 `edit_tab`에 있다). 그 밖에 재생 위치, 구역, 클립 순서, 프로젝트 탭이 있다.
 
 use eframe::egui::{self, Button, DragValue, RichText};
-use trackcut_core::edit::Edge;
-use trackcut_core::project::{Clip, Crop, Project, Track, TrackKind, SPEED_MAX_PCT, SPEED_MIN_PCT, VOLUME_MAX_DB, VOLUME_MIN_DB};
+use trackcut_core::project::{Project, TrackKind};
 use trackcut_core::time::{floor_frame, frame_time, nearest_frame, timecode, Flicks};
 
 use super::{TrackcutApp, PREVIEW_CHOICES};
@@ -19,13 +17,13 @@ pub enum Tab {
     Keys,
 }
 
-const KEYS: [(&str, &str); 19] = [
+const KEYS: [(&str, &str); 20] = [
     ("Space", "재생 / 정지 (구역을 선택했으면 그 구역의 끝까지만)"),
     ("← / →", "1프레임 이동"),
     ("Shift + ← / →", "1초 이동"),
     ("I / O", "선택한 구역의 시작 / 끝을 지금 위치로"),
     ("Delete", "선택한 구역 삭제"),
-    ("M", "선택한 트랙 음소거"),
+    ("M", "선택한 트랙의 소리 끄기 / 켜기"),
     ("U", "선택한 클립 연결 해제"),
     ("Ctrl+Z / Ctrl+Y", "되돌리기 / 다시 하기"),
     ("Ctrl+S", "프로젝트 저장"),
@@ -39,10 +37,8 @@ const KEYS: [(&str, &str); 19] = [
     ("클립 가운데 끌기", "이동"),
     ("클립 양 끝 끌기", "트림"),
     ("트랙 이름 두 번 누르기", "이름 바꾸기"),
+    ("트랙 이름 옆 \"켜짐 / 꺼짐\"", "그 트랙의 소리 켜기 / 끄기"),
 ];
-
-/// 내보낼 화면 크기 선택지.
-const SIZES: [(u32, u32); 4] = [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)];
 
 /// 이름과 값이 나란한 두 칸짜리 표.
 fn grid(ui: &mut egui::Ui, id: &str, rows: impl FnOnce(&mut egui::Ui)) {
@@ -168,180 +164,6 @@ impl TrackcutApp {
         if let Some(action) = action {
             self.on_timeline(action);
         }
-    }
-
-    /// 클립의 시작·길이·속도 칸(영상과 오디오 공통).
-    fn clip_rows(&mut self, ui: &mut egui::Ui, clip: &Clip) {
-        let Some(fps) = self.project.as_ref().map(|p| p.settings.fps) else { return };
-        let id = clip.id;
-        let frames = |t: Flicks| nearest_frame(t, fps);
-        let (mut start, mut len, mut speed) = (frames(clip.start), frames(clip.len()), clip.speed_pct);
-        let (mut moved, mut trimmed, mut sped) = (false, false, false);
-        grid(ui, "clip", |ui| {
-            ui.label("시작 (프레임)");
-            moved = ui.add(DragValue::new(&mut start).range(0..=i64::MAX)).changed();
-            ui.end_row();
-            ui.label("길이 (프레임)");
-            trimmed = ui.add(DragValue::new(&mut len).range(1..=i64::MAX)).changed();
-            ui.end_row();
-            ui.label("속도 (%)");
-            ui.horizontal(|ui| {
-                sped = ui.add(DragValue::new(&mut speed).range(SPEED_MIN_PCT..=SPEED_MAX_PCT)).changed();
-                for preset in [50, 100, 200] {
-                    if ui.small_button(format!("{preset}")).clicked() {
-                        (speed, sped) = (preset, true);
-                    }
-                }
-            });
-            ui.end_row();
-        });
-        if moved {
-            self.edit_keyed("클립 이동", &format!("move:{id}"), |p| p.move_clip(id, frame_time(start, fps)));
-        }
-        if trimmed {
-            let end = clip.start + frame_time(len, fps);
-            self.edit_keyed("트림", &format!("length:{id}"), |p| p.trim(id, Edge::End, end).map(|_| ()));
-        }
-        if sped {
-            self.edit_keyed("재생 속도", &format!("speed:{id}"), |p| p.set_speed(id, speed));
-        }
-        if moved || trimmed || sped {
-            self.seek(self.playhead);
-        }
-        ui.horizontal(|ui| {
-            ui.label(if clip.link.is_some() { "다른 클립과 연결됨" } else { "연결 없음" });
-            if clip.link.is_some() && ui.small_button("연결 해제").clicked() {
-                self.unlink();
-            }
-        });
-    }
-
-    fn video_section(&mut self, ui: &mut egui::Ui, clip: Clip) {
-        let Some(project) = &self.project else { return };
-        let label = clip_labels(project).remove(&clip.id).unwrap_or_default();
-        let source = project.media_info(clip.media).and_then(|m| m.video.as_ref()).map(|v| (v.width, v.height));
-        let output = (project.settings.width, project.settings.height);
-        ui.strong("영상 편집");
-        ui.label(label);
-        self.clip_rows(ui, &clip);
-
-        ui.add_space(8.0);
-        ui.strong("화면 자르기");
-        let was_on = self.crop_mode;
-        ui.toggle_value(&mut self.crop_mode, "미리보기에서 자르기");
-        if self.crop_mode && !was_on && !(clip.start <= self.playhead && self.playhead < clip.end()) {
-            // 자를 클립이 미리보기에 나오도록 재생 위치를 옮긴다
-            self.playing = false;
-            self.seek(clip.start);
-        }
-        if self.crop_mode {
-            ui.weak("미리보기의 빨간 테두리에서 손잡이를 끌어 자르고, 가운데를 끌어 옮긴다");
-        }
-        if let Some((width, height)) = source {
-            let crop = clip.crop;
-            ui.label(format!("남는 화면  {} × {}", width.saturating_sub(crop.left + crop.right), height.saturating_sub(crop.top + crop.bottom)));
-        }
-        if !clip.crop.is_none() && ui.button("자르기 초기화").clicked() {
-            let id = clip.id;
-            self.edit("화면 자르기 초기화", |p| p.set_crop(id, Crop::default()));
-        }
-
-        ui.add_space(8.0);
-        ui.strong("출력 해상도");
-        let mut chosen = output;
-        let name = |(w, h): (u32, u32)| format!("{w} × {h}");
-        egui::ComboBox::from_id_salt("output-size").selected_text(name(output)).show_ui(ui, |ui| {
-            if let Some(size) = source.filter(|s| !SIZES.contains(s)) {
-                ui.selectable_value(&mut chosen, size, format!("{} (원본)", name(size)));
-            }
-            for size in SIZES {
-                let text = if Some(size) == source { format!("{} (원본)", name(size)) } else { name(size) };
-                ui.selectable_value(&mut chosen, size, text);
-            }
-        });
-        ui.weak("내보내는 파일 전체의 화면 크기다. 키울 때는 Lanczos 방식으로 늘린다");
-        if chosen != output {
-            if let Some(project) = self.project.as_mut() {
-                (project.settings.width, project.settings.height) = chosen;
-                self.status = format!("출력 해상도 {}", name(chosen));
-            }
-        }
-    }
-
-    /// 트랙 이름과 소리 설정 칸.
-    fn track_rows(&mut self, ui: &mut egui::Ui, track: &Track) {
-        let id = track.id;
-        let (mut name, mut volume, mut muted, mut solo) = (track.name.clone(), track.volume_db, track.muted, track.solo);
-        let (mut renamed, mut volume_changed) = (false, false);
-        grid(ui, "track", |ui| {
-            ui.label("이름");
-            renamed = ui.add(egui::TextEdit::singleline(&mut name).desired_width(130.0)).changed();
-            ui.end_row();
-            if track.kind == TrackKind::Audio {
-                ui.label("볼륨 (dB)");
-                let value = DragValue::new(&mut volume).range(VOLUME_MIN_DB..=VOLUME_MAX_DB).speed(0.1).fixed_decimals(1);
-                volume_changed = ui.add(value).changed();
-                ui.end_row();
-                ui.label("소리");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut muted, "음소거");
-                    ui.checkbox(&mut solo, "솔로");
-                });
-                ui.end_row();
-            }
-        });
-        if renamed {
-            self.edit_keyed("트랙 이름 바꾸기", &format!("name:{id}"), |p| p.rename_track(id, &name));
-        }
-        if volume_changed {
-            self.edit_keyed("볼륨", &format!("volume:{id}"), |p| p.set_volume(id, volume).map(|_| ()));
-        }
-        if muted != track.muted {
-            self.edit("음소거", |p| p.set_muted(id, muted));
-        }
-        if solo != track.solo {
-            self.edit("솔로", |p| p.set_solo(id, solo));
-        }
-    }
-
-    fn audio_section(&mut self, ui: &mut egui::Ui, track: Track, clip: Option<Clip>) {
-        ui.strong("오디오 편집");
-        self.track_rows(ui, &track);
-        if let Some(clip) = &clip {
-            ui.add_space(8.0);
-            ui.strong("클립");
-            self.clip_rows(ui, clip);
-        }
-
-        ui.add_space(8.0);
-        ui.strong("소리 보정");
-        let fx = &mut self.fx;
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.denoise, "노이즈 제거");
-            ui.add_enabled(fx.denoise, DragValue::new(&mut fx.denoise_db).range(1.0..=40.0).speed(0.2).suffix(" dB"));
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut fx.highpass, "저음 잡음 차단");
-            ui.add_enabled(fx.highpass, DragValue::new(&mut fx.highpass_hz).range(20..=1000).suffix(" Hz"));
-        });
-        ui.label("이퀄라이저");
-        grid(ui, "equalizer", |ui| {
-            for (name, value) in [("저음 (120Hz)", &mut fx.low_db), ("중음 (1.5kHz)", &mut fx.mid_db), ("고음 (6kHz)", &mut fx.high_db)] {
-                ui.label(name);
-                ui.add(DragValue::new(value).range(-12.0..=12.0).speed(0.1).fixed_decimals(1).suffix(" dB"));
-                ui.end_row();
-            }
-        });
-        let ready = self.fx.filter().is_some() && self.fx_job.is_none();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(ready, Button::new("보정한 새 트랙 만들기")).clicked() {
-                self.start_fx(ui.ctx(), track.id);
-            }
-            if self.fx_job.is_some() {
-                ui.spinner();
-            }
-        });
-        ui.weak("원본 트랙은 그대로 두고 음소거만 한다. 보정한 소리는 바로 아래 새 트랙에 올라가서, 음소거·솔로로 번갈아 들으며 비교한다");
     }
 
     /// 클립 순서: 맨 위 트랙의 클립을 차례로 보여 주고, 앞뒤 순서를 바꾼다.

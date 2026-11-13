@@ -1,5 +1,6 @@
 //! 편집 화면의 상태와 화면 구성.
 
+mod edit_tab;
 mod inspector;
 mod panels;
 
@@ -15,7 +16,7 @@ use trackcut_core::history::History;
 use trackcut_core::labels::TracksMeta;
 use trackcut_core::media::{MediaInfo, VideoStream};
 use trackcut_core::probe::probe;
-use trackcut_core::project::{Clip, Crop, Project, TrackKind, VOLUME_MAX_DB, VOLUME_MIN_DB};
+use trackcut_core::project::{Clip, Crop, Project, TrackKind};
 use trackcut_core::time::{floor_frame, frame_time, parse_time, secs_to_flicks, Flicks, FLICKS_PER_SEC};
 
 use crate::drag::Drag;
@@ -50,12 +51,6 @@ fn video_at(project: &Project, t: Flicks, edit: bool) -> Option<(&Clip, &VideoSt
     let shown = |track: &trackcut_core::project::Track| track.kind == TrackKind::Video && track.is_edit() == edit;
     let clip = project.timeline.clips.iter().find(|c| c.start <= t && t < c.end() && project.track(c.track).is_some_and(shown))?;
     Some((clip, project.media_info(clip.media)?.video.as_ref()?))
-}
-
-enum MixerAction {
-    Mute(u64, bool),
-    Solo(u64, bool),
-    Volume(u64, f32),
 }
 
 pub struct TrackcutApp {
@@ -472,12 +467,15 @@ impl TrackcutApp {
 
     /// 선택한 트랙(없으면 선택한 클립의 트랙)의 음소거를 켜고 끈다.
     fn toggle_mute(&mut self) {
-        let track = self.project.as_ref().zip(self.selected_track).and_then(|(p, id)| p.track(id));
-        let Some((id, muted)) = track.map(|t| (t.id, t.muted)) else {
-            self.status = "트랙을 먼저 선택한다".into();
-            return;
-        };
-        self.edit(if muted { "음소거 해제" } else { "음소거" }, |p| p.set_muted(id, !muted));
+        match self.selected_track {
+            Some(track) => self.toggle_track_mute(track),
+            None => self.status = "트랙을 먼저 선택한다".into(),
+        }
+    }
+
+    fn toggle_track_mute(&mut self, track: u64) {
+        let Some(muted) = self.project.as_ref().and_then(|p| p.track(track)).map(|t| t.muted) else { return };
+        self.edit(if muted { "음소거 해제" } else { "음소거" }, |p| p.set_muted(track, !muted));
     }
 
     /// 선택한 클립이 다른 클립과 연결돼 있는지.
@@ -560,6 +558,7 @@ impl TrackcutApp {
                 self.selected_clip = Some(id);
                 self.unlink();
             }
+            Action::ToggleMute(track) => self.toggle_track_mute(track),
             Action::Rename(track, name) => {
                 self.edit("트랙 이름 바꾸기", |p| p.rename_track(track, &name));
             }
@@ -666,41 +665,6 @@ impl TrackcutApp {
         self.shown = Some((media, frame.frame));
     }
 
-    fn mixer(&mut self, ui: &mut egui::Ui) {
-        ui.heading("믹서");
-        let Some(project) = &self.project else { return };
-        let mut actions = Vec::new();
-        for track in project.timeline.tracks.iter().filter(|t| t.kind == TrackKind::Audio) {
-            ui.separator();
-            ui.label(&track.name);
-            ui.horizontal(|ui| {
-                let (mut muted, mut solo) = (track.muted, track.solo);
-                if ui.toggle_value(&mut muted, "음소거").changed() {
-                    actions.push(MixerAction::Mute(track.id, muted));
-                }
-                if ui.toggle_value(&mut solo, "솔로").changed() {
-                    actions.push(MixerAction::Solo(track.id, solo));
-                }
-            });
-            let mut volume = track.volume_db;
-            let slider = egui::Slider::new(&mut volume, VOLUME_MIN_DB..=VOLUME_MAX_DB).suffix(" dB").fixed_decimals(1);
-            if ui.add(slider).changed() {
-                actions.push(MixerAction::Volume(track.id, volume));
-            }
-        }
-        for action in actions {
-            match action {
-                MixerAction::Mute(id, on) => self.edit("음소거", |p| p.set_muted(id, on)),
-                MixerAction::Solo(id, on) => self.edit("솔로", |p| p.set_solo(id, on)),
-                // 슬라이더를 끄는 동안의 값들은 Undo 한 단계로 묶는다
-                MixerAction::Volume(id, db) => {
-                    self.edit_keyed("볼륨", &format!("volume:{id}"), |p| p.set_volume(id, db).map(|_| ()));
-                    None
-                }
-            };
-        }
-    }
-
     /// `--shot`: 화면이 준비되면 PNG로 저장하고 끝낸다.
     fn handle_shot(&mut self, ctx: &egui::Context) {
         let Some(path) = self.options.shot.clone() else { return };
@@ -775,6 +739,8 @@ impl eframe::App for TrackcutApp {
             egui::ScrollArea::vertical().show(ui, |ui| self.inspector(ui));
         });
         egui::TopBottomPanel::bottom("timeline").resizable(true).default_height(300.0).show(ctx, |ui| {
+            // 내용이 없을 때도 정해 둔 높이를 지킨다(안 그러면 패널이 내용 높이로 줄어든다)
+            ui.set_min_height(ui.available_height());
             let Some(project) = &self.project else { return };
             let labels = timeline::clip_labels(project);
             let marks = Marks {
@@ -789,9 +755,6 @@ impl eframe::App for TrackcutApp {
             for action in timeline::show(ui, project, &mut self.view, &marks, &self.sound.waves) {
                 self.on_timeline(action);
             }
-        });
-        egui::SidePanel::right("mixer").default_width(230.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.mixer(ui));
         });
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
